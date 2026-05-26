@@ -7,7 +7,7 @@
 ; #  A small tray app bundling six tools plus a custom-hotkey slot, #
 ; #  all configurable from a settings window (tray -> Settings).   #
 ; #                                                                #
-; #    1. Selection translator    (DeepL)                          #
+; #    1. Selection translator    (Google free / optional DeepL)   #
 ; #    2. Keyboard-layout fixer    (EN <-> RU same-key remap)      #
 ; #    3. Typo fixer              (LanguageTool API)               #
 ; #    4. Rotating rainbow border  (screen-edge overlay)           #
@@ -55,12 +55,14 @@ GITHUB_REPO := "K-r-o-n-o/Multitool"
 ;   def     : default value (string)
 ;   choices : array, only for type "choice"
 Schema := [
+    {sec:"Translator", key:"Provider",      label:"Provider",              type:"choice", def:"Google",
+        choices:["Google","DeepL"]},
     {sec:"Translator", key:"HotkeyPopup",   label:"Translate -> popup",    type:"hotkey", def:"^!t"},
     {sec:"Translator", key:"HotkeyCopy",    label:"Translate + copy",      type:"hotkey", def:"^!c"},
     {sec:"Translator", key:"HotkeyReplace", label:"Translate in place",    type:"hotkey", def:"^!r"},
     {sec:"Translator", key:"SourceLang",   label:"Source language",      type:"choice", def:"auto",
         choices:["auto","EN","RU","DE","FR","ES","IT","PT","JA","ZH"]},
-    {sec:"Translator", key:"DeepLKey",     label:"DeepL API key",        type:"string", def:"cf6542f2-6c71-4bd7-a67d-93961e26584b:fx"},
+    {sec:"Translator", key:"DeepLKey",     label:"DeepL API key",        type:"string", def:""},
     {sec:"Translator", key:"PopupWidth",   label:"Popup width (px)",     type:"int",    def:"360"},
     {sec:"Translator", key:"PopupTimeout", label:"Timeout ms (0=stay)",  type:"int",    def:"3000"},
     {sec:"Translator", key:"PopupAlpha",   label:"Opacity (0-255)",      type:"int",    def:"125"},
@@ -85,11 +87,12 @@ Schema := [
     {sec:"Rainbow",    key:"Sat",          label:"Saturation (0-1)",     type:"float",  def:"1.0"},
     {sec:"Rainbow",    key:"Val",          label:"Brightness (0-1)",     type:"float",  def:"1.0"},
 
-    {sec:"Deploy",     key:"Hotkey", label:"Deploy hotkey",  type:"hotkey", def:"^#d"},
-    {sec:"Deploy",     key:"Path",   label:"Project folder", type:"string", def:""},
-    {sec:"Deploy",     key:"Msg",    label:"Commit message", type:"string", def:"autodeploy via script"},
-    {sec:"Deploy",     key:"Branch", label:"Branch",         type:"string", def:""},
-    {sec:"Deploy",     key:"Shell",  label:"Terminal",       type:"choice", def:"cmd", choices:["cmd","powershell"]},
+    {sec:"Deploy",     key:"Hotkey",  label:"Deploy hotkey",       type:"hotkey", def:"^#d"},
+    {sec:"Deploy",     key:"Path",    label:"Project folder",      type:"string", def:""},
+    {sec:"Deploy",     key:"RepoUrl", label:"Repo URL (optional)", type:"string", def:""},
+    {sec:"Deploy",     key:"Branch",  label:"Branch",              type:"string", def:""},
+    {sec:"Deploy",     key:"Msg",     label:"Commit message",      type:"string", def:"autodeploy via script"},
+    {sec:"Deploy",     key:"Shell",   label:"Terminal",            type:"choice", def:"cmd", choices:["cmd","powershell"]},
 
     {sec:"Pin",        key:"HotkeyPin",   label:"Pin (click-through)", type:"hotkey", def:"#t"},
     {sec:"Pin",        key:"HotkeyUnpin", label:"Unpin all",           type:"hotkey", def:"#c"},
@@ -141,6 +144,7 @@ gFwd := Map(
 ; ==================================================================
 C       := Map()        ; live config: "Sec_Key" -> string value
 Ctrls   := Map()        ; settings-window controls: "Sec_Key" -> Gui control
+Labels  := Map()        ; "Sec_Key" -> label text control (when present)
 g_Set   := ""           ; the settings Gui (when open)
 ActiveHotkeys := []     ; hotkey strings currently registered
 
@@ -456,7 +460,7 @@ Theme_Palette(name) {
 ; ===  SETTINGS WINDOW  ============================================
 ; ==================================================================
 ShowSettings(*) {
-    global g_Set, Ctrls, Schema, Sections, TabNames, C
+    global g_Set, Ctrls, Labels, Schema, Sections, TabNames, C
 
     if IsObject(g_Set) {
         try {
@@ -468,6 +472,7 @@ ShowSettings(*) {
     t := Theme_Palette(CfgS("General_Theme"))
 
     Ctrls := Map()
+    Labels := Map()
     g := Gui("+OwnDialogs -Resize -MaximizeBox", "MultiTool Settings")
     g.BackColor := t.bg
     g.SetFont("s10 c" t.fg, "Segoe UI")
@@ -497,19 +502,22 @@ ShowSettings(*) {
                 cb.Value := (val = "1") ? 1 : 0
                 Ctrls[k] := cb
             } else {
-                g.AddText("x28 y" (yPos + 3) " w175", item.label ":")
+                lbl := g.AddText("x28 y" (yPos + 3) " w175", item.label ":")
+                Labels[k] := lbl
                 if (item.type = "choice") {
                     dd := g.AddDropDownList("x210 y" yPos " w200 Background" t.editBg, item.choices)
                     dd.Text := val
                     Ctrls[k] := dd
                 } else {
-                    w := InStr(item.key, "Path") ? 300 : (item.type = "hotkey" ? 150 : 200)
+                    w := (InStr(item.key, "Path") || InStr(item.key, "Url")) ? 300 : (item.type = "hotkey" ? 150 : 200)
                     ed := g.AddEdit("x210 y" yPos " w" w " Background" t.editBg, val)
                     Ctrls[k] := ed
                 }
             }
             yPos += 31
         }
+        if (sec = "Translator")
+            ExtendTranslatorTab(g, t, &yPos)
     }
     tab.UseTab(0)
 
@@ -539,6 +547,35 @@ ShowSettings(*) {
     g.OnEvent("Close", (*) => g.Destroy())
     g.OnEvent("Escape", (*) => g.Destroy())
     g.Show("w540 h468")
+}
+
+; After the Translator section renders, drop a help link below the API
+; key field and wire the Provider dropdown so the key row is hidden
+; unless the user picks DeepL (Google needs no key).
+ExtendTranslatorTab(g, t, &yPos) {
+    global Ctrls, Labels
+    if (!Ctrls.Has("Translator_Provider") || !Ctrls.Has("Translator_DeepLKey"))
+        return
+    provDD := Ctrls["Translator_Provider"]
+    keyEd  := Ctrls["Translator_DeepLKey"]
+    keyLbl := Labels.Has("Translator_DeepLKey") ? Labels["Translator_DeepLKey"] : ""
+
+    keyEd.GetPos(, &kY, , &kH)
+    g.SetFont("s9 c" t.hintFg, "Segoe UI")
+    keyLink := g.AddLink("x210 y" (kY + kH + 4) " w300",
+        'Get a free key (500k chars/month): <a href="https://www.deepl.com/pro-api">deepl.com/pro-api</a>')
+    g.SetFont("s10 c" t.fg, "Segoe UI")
+    yPos += 22
+
+    toggle(*) {
+        show := (provDD.Text = "DeepL")
+        keyEd.Visible := show
+        keyLink.Visible := show
+        if keyLbl
+            keyLbl.Visible := show
+    }
+    provDD.OnEvent("Change", toggle)
+    toggle()
 }
 
 ; Renders the Custom tab as five rows of {Hotkey, Type, Action} so the
@@ -711,7 +748,11 @@ DoTranslate(mode) {
         return
 
     target := RegExMatch(text, "[\x{0400}-\x{04FF}]") ? "EN-US" : "RU"
-    result := DeepL_Translate(text, CfgS("Translator_SourceLang"), target)
+    provider := CfgS("Translator_Provider")
+    if (provider = "DeepL")
+        result := DeepL_Translate(text, CfgS("Translator_SourceLang"), target)
+    else
+        result := Google_Translate(text, CfgS("Translator_SourceLang"), target)
 
     if !result.ok {
         Tr_ShowPopup(result.text)
@@ -768,6 +809,51 @@ ParseDeepL(json) {
     if (p && RegExMatch(json, '"text":"((?:\\.|[^"\\])*)"', &m, p))
         return Unescape(m[1])
     return "(no translation)"
+}
+
+; Google's unofficial translate endpoint. Free, no key, lower quality
+; than DeepL on long passages but fine for short selections. Accepts
+; the same DeepL-style language codes as DeepL_Translate -- they get
+; downcased + truncated to two letters for Google's API.
+Google_Translate(text, sourceLang, targetLang) {
+    sl := GoogleLang(sourceLang)
+    tl := GoogleLang(targetLang)
+    url := "https://translate.googleapis.com/translate_a/single"
+         . "?client=gtx&sl=" sl "&tl=" tl "&dt=t&q=" UriEncode(text)
+    try {
+        req := ComObject("WinHttp.WinHttpRequest.5.1")
+        req.Open("GET", url, false)
+        req.SetRequestHeader("User-Agent", "Mozilla/5.0")
+        req.Send()
+        if (req.Status != 200)
+            return {ok: false, text: "Google HTTP " req.Status}
+        return {ok: true, text: ParseGoogle(ReadUtf8Body(req))}
+    } catch as e {
+        return {ok: false, text: "Google failed: " e.Message}
+    }
+}
+
+ParseGoogle(json) {
+    ; Response: [[["translated","source",null,null,...], ...], ...]
+    ; Each translated segment is the first element of an inner array.
+    block := json
+    if (p := InStr(block, "]],"))
+        block := SubStr(block, 1, p)
+    out := "", pos := 1
+    pat := '\["((?:\\.|[^"\\])*)","(?:\\.|[^"\\])*"'
+    while (foundAt := RegExMatch(block, pat, &m, pos)) {
+        out .= m[1]
+        pos := foundAt + m.Len(0)
+    }
+    return out = "" ? "(no translation)" : Unescape(out)
+}
+
+; Map a DeepL-style code (auto, EN-US, RU) to Google's 2-letter code.
+GoogleLang(lang) {
+    if (lang = "" || lang = "auto")
+        return "auto"
+    parts := StrSplit(lang, "-")
+    return StrLower(parts[1])
 }
 
 ; Read a WinHttp response body as UTF-8 text. Used by the translator and
@@ -1255,21 +1341,76 @@ HsvToBGRA(h, s, v) {
 ; ===  5. GIT AUTO-DEPLOY  =========================================
 ; ==================================================================
 Deploy() {
-    path   := CfgS("Deploy_Path")
-    msg    := CfgS("Deploy_Msg")
-    branch := CfgS("Deploy_Branch")
-    shell  := CfgS("Deploy_Shell")
+    path    := CfgS("Deploy_Path")
+    msg     := CfgS("Deploy_Msg")
+    branch  := CfgS("Deploy_Branch")
+    shell   := CfgS("Deploy_Shell")
+    repoUrl := Trim(CfgS("Deploy_RepoUrl"))
+
+    if (path = "" || !DirExist(path)) {
+        MsgBox("Deploy folder is not set or doesn't exist:`n" path "`n`nSettings -> Deploy -> Project folder.",
+            "MultiTool", "Icon!")
+        return
+    }
+    if (branch = "") {
+        MsgBox("Deploy branch is not set.`n`nSettings -> Deploy -> Branch.", "MultiTool", "Icon!")
+        return
+    }
+
+    ; Where is this push actually going? If RepoUrl override is empty,
+    ; fall back to whatever `origin` points to in the folder.
+    effectiveUrl := (repoUrl != "") ? repoUrl : GetOriginUrl(path)
+    sourceLabel  := (repoUrl != "") ? "explicit URL" : "folder's origin"
+    if (effectiveUrl = "") {
+        effectiveUrl := "<no origin remote configured in this folder>"
+        sourceLabel  := "??"
+    }
+
+    preview := "About to commit + push:`n`n"
+        . "Folder:   " path "`n"
+        . "Branch:   " branch "`n"
+        . "Repo:     " effectiveUrl "`n"
+        . "Source:   " sourceLabel "`n"
+        . "Message:  " msg "`n`n"
+        . "Continue?"
+    r := MsgBox(preview, "MultiTool: confirm deploy", "OKCancel Iconi")
+    if (r != "OK")
+        return
+
+    pushTarget := (repoUrl != "") ? repoUrl : "origin"
 
     if (shell = "powershell") {
-        ps := "cd '" path "'; git add .; git commit -m '" msg "'; if ($?) { git push origin " branch " }"
+        ps := "cd '" path "'; git add .; git commit -m '" msg "'; if ($?) { git push '" pushTarget "' " branch " }"
         cmd := 'powershell.exe -NoExit -Command "' ps '"'
     } else {
         cmd := 'cmd.exe /k "cd /d "' path '"'
              . ' && git add .'
              . ' && git commit -m "' msg '"'
-             . ' && git push origin ' branch '"'
+             . ' && git push "' pushTarget '" ' branch '"'
     }
     Run(cmd)
+}
+
+; Reads the `origin` remote URL of a git repo at `folder`. Returns ""
+; if the folder isn't a git repo, has no `origin`, or git isn't on PATH.
+GetOriginUrl(folder) {
+    if (folder = "" || !DirExist(folder))
+        return ""
+    tmp := A_Temp "\multitool_origin.txt"
+    try FileDelete(tmp)
+    try {
+        ; Outer quotes wrap the whole cmd /c argument; cmd /S strips them
+        ; so the inner quotes around path/tmp survive into git's argv.
+        RunWait(A_ComSpec ' /c "git -C "' folder '" remote get-url origin > "' tmp '" 2>nul"', , "Hide")
+        if !FileExist(tmp)
+            return ""
+        out := FileRead(tmp)
+        try FileDelete(tmp)
+        return Trim(out, " `t`r`n")
+    } catch {
+        try FileDelete(tmp)
+        return ""
+    }
 }
 
 
