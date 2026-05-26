@@ -1,0 +1,10 @@
+# Personal user settings (don't share)
+multitool.ini
+
+# Build artifacts -- distributed via GitHub Releases, not committed
+*.exe
+*.bak
+
+# OS / editor noise
+Thumbs.db
+.vscode/
