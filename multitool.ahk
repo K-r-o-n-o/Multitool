@@ -4,7 +4,7 @@
 ; ##################################################################
 ; #                          MULTITOOL                             #
 ; #                                                                #
-; #  A small tray app bundling six tools plus a custom-hotkey slot, #
+; #  A small tray app bundling seven tools + a custom-hotkey slot,  #
 ; #  all configurable from a settings window (tray -> Settings).   #
 ; #                                                                #
 ; #    1. Selection translator    (Google free / optional DeepL)   #
@@ -13,6 +13,7 @@
 ; #    4. Rotating rainbow border  (screen-edge overlay)           #
 ; #    5. Git auto-push            (add/commit/push a folder)      #
 ; #    6. Pin-on-top               (click-through overlay window)   #
+; #    7. Keystroke sentinel       (rhythm-based screen lock)       #
 ; #    +. Custom hotkeys           (5 user-defined Run/Paste slots) #
 ; #                                                                #
 ; #  Settings persist to "multitool.ini" beside this script.       #
@@ -30,6 +31,7 @@
 ; #    Ctrl+Win+D       git push (add/commit/push)                 #
 ; #    Win+T / Win+C    pin window / unpin all                     #
 ; #    Ctrl+Win+S       open Settings                              #
+; #    (set in Settings) toggle keystroke sentinel                 #
 ; #    Ctrl+Win+Q       quit MultiTool                             #
 ; #    Esc              close an open popup (fixed, not config.)    #
 ; ##################################################################
@@ -41,7 +43,7 @@ try DllCall("SetThreadDpiAwarenessContext", "ptr", -4)   ; PER_MONITOR_AWARE_V2
 INI := A_ScriptDir "\multitool.ini"
 
 ; --- bump this when you publish a new GitHub release ---
-APP_VERSION := "1.1.0"
+APP_VERSION := "1.1.1"
 GITHUB_REPO := "K-r-o-n-o/Multitool"
 
 
@@ -98,6 +100,10 @@ Schema := [
     {sec:"Pin",        key:"HotkeyUnpin", label:"Unpin all",           type:"hotkey", def:"#c"},
     {sec:"Pin",        key:"Alpha",       label:"Pinned opacity",      type:"int",    def:"150"},
 
+    {sec:"Security",   key:"Enabled",      label:"Enable keystroke sentinel", type:"bool",   def:"0"},
+    {sec:"Security",   key:"HotkeyToggle", label:"Toggle sentinel",           type:"hotkey", def:""},
+    {sec:"Security",   key:"PythonPath",   label:"Python executable",         type:"string", def:"python"},
+
     {sec:"Custom", key:"Hotkey1", label:"#1", type:"hotkey", def:""},
     {sec:"Custom", key:"Type1",   label:"#1", type:"choice", def:"Run", choices:["Run","Paste"]},
     {sec:"Custom", key:"Action1", label:"#1", type:"string", def:""},
@@ -121,10 +127,10 @@ Schema := [
     {sec:"General",    key:"RunOnStartup",   label:"Run on Windows startup", type:"bool", def:"0"}
 ]
 
-Sections := ["Translator","LayoutFix","TypoFix","Rainbow","Push","Pin","Custom","General"]
+Sections := ["Translator","LayoutFix","TypoFix","Rainbow","Push","Pin","Custom","Security","General"]
 TabNames := Map("Translator","Translator", "LayoutFix","Layout Fix", "TypoFix","Typo Fix",
                 "Rainbow","Rainbow", "Push","For Devs", "Pin","Pin",
-                "Custom","Custom", "General","General")
+                "Custom","Custom", "Security","Security", "General","General")
 
 ; --- the layout map: Latin key char -> Cyrillic char on the same key ---
 ; (this is fixed, not exposed in the settings window)
@@ -160,6 +166,10 @@ bW := 0, bH := 0, bInvP := 0.0, bThick := 2, bSpeed := 0.025
 bInterval := 33, bOffset := 0.0, bPalette := []
 bPtDst := "", bSzWin := "", bPtSrc := "", bBlend := ""
 
+; keystroke-sentinel module state -- must be assigned before Sec_Apply runs
+; in STARTUP below, so we keep it up here rather than next to the helpers.
+SentinelPID := 0
+
 
 ; ==================================================================
 ; ===  STARTUP  ====================================================
@@ -170,6 +180,7 @@ BuildBorder()
 RegisterHotkeys()
 SetupTray()
 OnExit(OnExitHandler)
+Sec_Apply(false)   ; resume the keystroke sentinel if it was left enabled
 TrayTip("Right-click the tray icon -> Settings to configure.", "MultiTool loaded")
 
 ; Background update check 5 s after startup so it doesn't slow boot.
@@ -404,6 +415,7 @@ RegisterHotkeys() {
         [CfgS("Push_Hotkey"),            (*) => DoPush()],
         [CfgS("Pin_HotkeyPin"),          (*) => PinWindow()],
         [CfgS("Pin_HotkeyUnpin"),        (*) => UnpinAll()],
+        [CfgS("Security_HotkeyToggle"),  (*) => Sec_Toggle()],
         [CfgS("General_HotkeyQuit"),     (*) => ExitApp()],
         [CfgS("General_HotkeySettings"), (*) => ShowSettings()]
     ]
@@ -501,9 +513,9 @@ ShowSettings(*) {
     g.SetFont("s10 c" t.fg, "Segoe UI")
     g_Set := g
 
-    tab := g.AddTab3("x10 y10 w520 h378", [TabNames["Translator"], TabNames["LayoutFix"],
+    tab := g.AddTab3("x10 y10 w600 h378", [TabNames["Translator"], TabNames["LayoutFix"],
         TabNames["TypoFix"], TabNames["Rainbow"], TabNames["Push"], TabNames["Pin"],
-        TabNames["Custom"], TabNames["General"]])
+        TabNames["Custom"], TabNames["Security"], TabNames["General"]])
 
     tabIdx := 0
     for sec in Sections {
@@ -541,16 +553,18 @@ ShowSettings(*) {
         }
         if (sec = "Translator")
             ExtendTranslatorTab(g, t, &yPos)
+        if (sec = "Security")
+            ExtendSecurityTab(g, t, &yPos)
     }
     tab.UseTab(0)
 
     g.SetFont("s9 c" t.hintFg, "Segoe UI")
-    g.AddText("x16 y396 w330", "Hotkeys:   ^ Ctrl    ! Alt    # Win    + Shift")
+    g.AddText("x16 y396 w380", "Hotkeys:   ^ Ctrl    ! Alt    # Win    + Shift")
     g.SetFont("s10 c" t.fg, "Segoe UI")
 
-    g.AddButton("x300 y422 w72 h28", "Cancel").OnEvent("Click", (*) => g.Destroy())
-    g.AddButton("x378 y422 w72 h28", "Apply").OnEvent("Click", ApplyAndRefresh)
-    g.AddButton("x456 y422 w72 h28 +Default", "Save").OnEvent("Click", SaveAndClose)
+    g.AddButton("x380 y422 w72 h28", "Cancel").OnEvent("Click", (*) => g.Destroy())
+    g.AddButton("x458 y422 w72 h28", "Apply").OnEvent("Click", ApplyAndRefresh)
+    g.AddButton("x536 y422 w72 h28 +Default", "Save").OnEvent("Click", SaveAndClose)
 
     ApplyAndRefresh(*) {
         prevTheme := CfgS("General_Theme")
@@ -569,7 +583,7 @@ ShowSettings(*) {
 
     g.OnEvent("Close", (*) => g.Destroy())
     g.OnEvent("Escape", (*) => g.Destroy())
-    g.Show("w540 h468")
+    g.Show("w620 h468")
 }
 
 ; After the Translator section renders, drop a help link below the API
@@ -599,6 +613,38 @@ ExtendTranslatorTab(g, t, &yPos) {
     }
     provDD.OnEvent("Change", toggle)
     toggle()
+}
+
+; After the Security section renders its checkbox / hotkey / python rows,
+; add an "Enroll" button, a live profile-status line, and the honest
+; warning that this is a deterrent -- real protection lives in Windows.
+ExtendSecurityTab(g, t, &yPos) {
+    g.SetFont("s10 c" t.fg, "Segoe UI")
+    g.AddButton("x28 y" yPos " w200 h28", "Enroll typing profile...")
+        .OnEvent("Click", (*) => Sec_Enroll())
+
+    g.SetFont("s9 c" t.hintFg, "Segoe UI")
+    g.AddText("x240 y" (yPos + 6) " w300", Sec_StatusLine())
+    yPos += 42
+
+    g.SetFont("s10 bold c" t.popupAccent, "Segoe UI")
+    g.AddText("x28 y" yPos " w540",
+        "For much better security you have to use Real protection on Windows "
+        "(BitLocker + Windows Hello + Dynamic Lock).")
+    yPos += 50
+
+    g.SetFont("s9 c" t.hintFg, "Segoe UI")
+    g.AddText("x28 y" yPos " w540",
+        "The sentinel watches only your typing rhythm (timing aggregates -- never "
+        "the keys or text you type) and locks the screen if the rhythm stops "
+        "matching your profile. Enroll once, then tick Enable. Anyone with access "
+        "to your unlocked session can still close it, so treat it as a deterrent.")
+    yPos += 56
+
+    g.AddText("x28 y" yPos " w540",
+        "Needs Python on this PC with: scikit-learn, numpy, pynput  "
+        "(pip install -r requirements.txt).")
+    g.SetFont("s10 c" t.fg, "Segoe UI")
 }
 
 ; Renders the Custom tab as five rows of {Hotkey, Type, Action} so the
@@ -704,6 +750,7 @@ ApplyFromControls() {
     errs := RegisterHotkeys()
     BuildBorder()
     SetStartup(C["General_RunOnStartup"] = "1")
+    Sec_Apply()
 
     if (errs != "") {
         MsgBox("Some hotkeys could not be set:`n`n" errs "`nThe rest were applied.",
@@ -1465,9 +1512,135 @@ UnpinAll() {
 
 
 ; ==================================================================
+; ===  7. KEYSTROKE SENTINEL  ======================================
+; ==================================================================
+; Thin wrapper around sentinel.py (sitting beside this script): a
+; behavioral-biometric locker that learns your typing rhythm and locks
+; the workstation when the rhythm stops matching. MultiTool never sees
+; keystrokes -- the Python helper only emits timing aggregates. While
+; enabled we keep `sentinel.py monitor` running as a hidden background
+; process and tear it down when disabled or on exit.
+;
+; State lives in SentinelPID (0 = not running). The trained profile and
+; the script are both expected next to this script/exe.
+; (SentinelPID is initialized in the GLOBAL STATE block at the top.)
+
+SentinelScript() {
+    return A_ScriptDir "\sentinel.py"
+}
+SentinelProfile() {
+    ; Matches MODEL_PATH in sentinel.py (pickle saved beside the script).
+    return A_ScriptDir "\sentinel_profile.pkl"
+}
+Sec_Python() {
+    p := Trim(CfgS("Security_PythonPath"))
+    return (p = "") ? "python" : p
+}
+Sec_StatusLine() {
+    if !FileExist(SentinelScript())
+        return "sentinel.py not found beside MultiTool."
+    return FileExist(SentinelProfile())
+        ? "Typing profile: trained and ready."
+        : "Typing profile: none yet -- enroll first."
+}
+Sec_IsRunning() {
+    global SentinelPID
+    return SentinelPID && ProcessExist(SentinelPID)
+}
+
+; Reconcile the running monitor with the Enabled setting. interactive is
+; false at startup so a missing profile/python doesn't pop dialogs at boot.
+Sec_Apply(interactive := true) {
+    if (CfgS("Security_Enabled") = "1")
+        Sec_Start(interactive)
+    else
+        Sec_Stop()
+}
+
+Sec_Start(interactive := true) {
+    global SentinelPID
+    if Sec_IsRunning()
+        return
+    script := SentinelScript()
+    if !FileExist(script) {
+        if interactive
+            MsgBox("sentinel.py was not found next to MultiTool:`n`n" script
+                "`n`nKeep sentinel.py in the same folder as this app.",
+                "MultiTool", "Icon!")
+        return
+    }
+    if !FileExist(SentinelProfile()) {
+        if interactive {
+            r := MsgBox("The keystroke sentinel must learn your typing rhythm before "
+                "it can run.`n`nEnroll a profile now? (Type normally for a few "
+                "minutes in the console that opens.)", "MultiTool", "YesNo Iconi")
+            if (r = "Yes")
+                Sec_Enroll()
+        } else {
+            TrayTip("Sentinel is enabled but has no profile yet -- open "
+                "Settings -> Security to enroll.", "MultiTool")
+        }
+        return
+    }
+    try {
+        Run(Format('"{1}" "{2}" monitor', Sec_Python(), script), A_ScriptDir, "Hide", &pid)
+        SentinelPID := pid
+        if interactive
+            TrayTip("Keystroke sentinel is watching your typing rhythm.", "MultiTool")
+    } catch as e {
+        SentinelPID := 0
+        if interactive
+            MsgBox("Couldn't start the keystroke sentinel:`n`n" e.Message
+                "`n`nCheck the Python executable in Settings -> Security, and that "
+                "scikit-learn, numpy and pynput are installed.", "MultiTool", "Icon!")
+    }
+}
+
+Sec_Stop() {
+    global SentinelPID
+    if (SentinelPID && ProcessExist(SentinelPID))
+        ; /T also kills children (e.g. when launched through the py launcher).
+        try RunWait("taskkill /PID " SentinelPID " /T /F", , "Hide")
+    SentinelPID := 0
+}
+
+; Flip the Enabled flag (used by the toggle hotkey), persist just that key
+; so a later Apply/restart agrees, then reconcile the running process.
+Sec_Toggle() {
+    global C, INI
+    newVal := (CfgS("Security_Enabled") = "1") ? "0" : "1"
+    C["Security_Enabled"] := newVal
+    IniWrite(newVal, INI, "Security", "Enabled")
+    if (newVal = "1") {
+        Sec_Apply(true)
+    } else {
+        Sec_Stop()
+        TrayTip("Keystroke sentinel stopped.", "MultiTool")
+    }
+}
+
+; Launch enrollment in a VISIBLE console so the user can watch the progress
+; bar while typing. sentinel.py writes the profile and exits on its own.
+Sec_Enroll() {
+    script := SentinelScript()
+    if !FileExist(script) {
+        MsgBox("sentinel.py was not found next to MultiTool:`n`n" script,
+            "MultiTool", "Icon!")
+        return
+    }
+    try Run(Format('"{1}" "{2}" enroll', Sec_Python(), script), A_ScriptDir)
+    catch as e
+        MsgBox("Couldn't start enrollment:`n`n" e.Message
+            "`n`nCheck the Python executable in Settings -> Security.",
+            "MultiTool", "Icon!")
+}
+
+
+; ==================================================================
 ; ===  EXIT  =======================================================
 ; ==================================================================
 OnExitHandler(*) {
     UnpinAll()
     DestroyBorder()
+    Sec_Stop()
 }

@@ -1,10 +1,37 @@
-# Personal user settings (don't share)
+# ─── MultiTool: secrets & personal data (NEVER commit) ───────────────
+# Holds the DeepL API key, your Windows username/paths, and push config.
+# The app recreates it from defaults on first save.
 multitool.ini
 
-# Build artifacts -- distributed via GitHub Releases, not committed
-*.exe
+# Your personal keystroke-biometric profile, written by `sentinel.py enroll`.
+sentinel_profile.pkl
+*.pkl
+
+# Backup created when recompiling the exe.
+multitool.exe.bak
 *.bak
 
-# OS / editor noise
-Thumbs.db
+# ─── Build / distribution ────────────────────────────────────────────
+# Ship the compiled binary as a GitHub *Release* asset (your auto-updater
+# pulls it from /releases/latest). Uncomment to keep it out of the tree:
+# multitool.exe
+
+# Ahk2Exe leftovers
+*.exe~
+
+# ─── Python (sentinel.py) ────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+
+# ─── Editors / OS cruft ──────────────────────────────────────────────
 .vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store
