@@ -532,29 +532,31 @@ ShowSettings(*) {
         names.Push(page.name)
     tab := g.AddTab3("x10 y10 w600 h378", names)
 
+    ; Merged pages (Text, Screen) carry several tools. AHK can't nest Tab
+    ; controls reliably -- a nested tab's controls don't hide when the OUTER
+    ; tab changes, so they bleed onto every page. Instead we fake sub-tabs:
+    ; a selector-button row plus manual show/hide of each tool's controls.
+    ; Those controls all belong to the single outer page, which AHK *does*
+    ; hide correctly when you switch top-level tabs.
+    merged := Map()                ; outer tab index -> sub-tab state
     tabIdx := 0
     for page in TabLayout {
         tabIdx++
         tab.UseTab(tabIdx)
-        if (page.subs.Length = 1) {
-            ; One tool on this tab -- render it straight onto the page.
+        if (page.subs.Length = 1)
             RenderSection(g, t, page.subs[1], 48)
-        } else {
-            ; Several related tools -- give each its own nested sub-tab.
-            subNames := []
-            for sec in page.subs
-                subNames.Push(TabNames[sec])
-            sub := g.AddTab3("x16 y42 w588 h342", subNames)
-            subIdx := 0
-            for sec in page.subs {
-                subIdx++
-                sub.UseTab(subIdx)
-                RenderSection(g, t, sec, 78)
-            }
-            sub.UseTab(0)
-        }
+        else
+            merged[tabIdx] := BuildMergedTab(g, t, page.subs)
     }
     tab.UseTab(0)
+
+    ; Switching back to a merged tab makes AHK re-show all of its controls
+    ; (every sub-view at once), so reassert the active sub-view afterwards.
+    tab.OnEvent("Change", ReassertSub)
+    ReassertSub(*) {
+        if merged.Has(tab.Value)
+            ShowSub(merged[tab.Value], merged[tab.Value].cur)
+    }
 
     g.SetFont("s9 c" t.hintFg, "Segoe UI")
     g.AddText("x16 y396 w380", "Hotkeys:   ^ Ctrl    ! Alt    # Win    + Shift")
@@ -582,6 +584,68 @@ ShowSettings(*) {
     g.OnEvent("Close", (*) => g.Destroy())
     g.OnEvent("Escape", (*) => g.Destroy())
     g.Show("w620 h468")
+    ReassertSub()   ; the default tab is merged (Text) -- collapse it to sub 1
+}
+
+; Build one merged top-level tab (Text / Screen): a row of selector buttons
+; plus each tool's controls rendered into the same area, then collapsed to
+; the first tool. Returns the sub-tab state {subs, buttons, cur} that
+; ShowSub uses to flip between tools.
+BuildMergedTab(g, t, subs) {
+    global TabNames
+    state := {subs: [], buttons: [], cur: 1}
+
+    ; Selector buttons across the top of the page act as the sub-tabs.
+    bx := 16
+    for i, sec in subs {
+        btn := g.AddButton("x" bx " y40 w120 h26", TabNames[sec])
+        btn.OnEvent("Click", SubBtnHandler(state, i))
+        state.buttons.Push(btn)
+        bx += 124
+    }
+
+    ; Render each tool below the buttons, capturing exactly the controls it
+    ; created (including the Translator / Security extras) by diffing the
+    ; GUI's control set before and after, so we can show/hide them as a group.
+    ; Note: enumerate with TWO variables everywhere -- `for hwnd in g` binds
+    ; the control OBJECT (1-var enum yields the value), so the hwnd keys would
+    ; never match and every sub would capture every control.
+    for i, sec in subs {
+        seen := Map()
+        for hwnd, ctrl in g
+            seen[hwnd] := true
+        refresh := RenderSection(g, t, sec, 78)
+        ctrls := []
+        for hwnd, ctrl in g
+            if !seen.Has(hwnd)
+                ctrls.Push(ctrl)
+        state.subs.Push({ctrls: ctrls, refresh: refresh})
+    }
+
+    ShowSub(state, 1)
+    return state
+}
+
+; Closure factory so each selector button captures its own index (AHK loop
+; iterations share a scope, so closing over `i` directly would misbind).
+SubBtnHandler(state, idx) {
+    return (*) => ShowSub(state, idx)
+}
+
+; Show sub-tab `idx` of a merged page and hide the rest; bold the active
+; selector button. A tool may hand back a refresh callback (the Translator
+; provider toggle) to re-run each time it becomes visible.
+ShowSub(state, idx) {
+    state.cur := idx
+    for j, sub in state.subs {
+        vis := (j = idx)
+        for ctrl in sub.ctrls
+            ctrl.Visible := vis
+        if (vis && sub.refresh)
+            sub.refresh.Call()
+    }
+    for j, btn in state.buttons
+        btn.SetFont(j = idx ? "Bold" : "Norm")
 }
 
 ; Render one Schema section's controls onto the current (sub-)tab page,
@@ -594,7 +658,7 @@ RenderSection(g, t, sec, yStart) {
 
     if (sec = "Custom") {
         BuildCustomTab(g, t)
-        return
+        return ""
     }
 
     yPos := yStart
@@ -623,10 +687,12 @@ RenderSection(g, t, sec, yStart) {
         }
         yPos += 31
     }
+    refresh := ""
     if (sec = "Translator")
-        ExtendTranslatorTab(g, t, &yPos)
+        refresh := ExtendTranslatorTab(g, t, &yPos)
     if (sec = "Security")
         ExtendSecurityTab(g, t, &yPos)
+    return refresh
 }
 
 ; After the Translator section renders, drop a help link below the API
@@ -635,7 +701,7 @@ RenderSection(g, t, sec, yStart) {
 ExtendTranslatorTab(g, t, &yPos) {
     global Ctrls, Labels
     if (!Ctrls.Has("Translator_Provider") || !Ctrls.Has("Translator_DeepLKey"))
-        return
+        return ""
     provDD := Ctrls["Translator_Provider"]
     keyEd  := Ctrls["Translator_DeepLKey"]
     keyLbl := Labels.Has("Translator_DeepLKey") ? Labels["Translator_DeepLKey"] : ""
@@ -656,6 +722,7 @@ ExtendTranslatorTab(g, t, &yPos) {
     }
     provDD.OnEvent("Change", toggle)
     toggle()
+    return toggle
 }
 
 ; After the Security section renders its checkbox / hotkey / python rows,
