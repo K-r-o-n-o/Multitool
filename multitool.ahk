@@ -43,7 +43,7 @@ try DllCall("SetThreadDpiAwarenessContext", "ptr", -4)   ; PER_MONITOR_AWARE_V2
 INI := A_ScriptDir "\multitool.ini"
 
 ; --- bump this when you publish a new GitHub release ---
-APP_VERSION := "1.1.1"
+APP_VERSION := "1.1.2"
 GITHUB_REPO := "K-r-o-n-o/Multitool"
 
 
