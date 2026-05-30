@@ -127,10 +127,24 @@ Schema := [
     {sec:"General",    key:"RunOnStartup",   label:"Run on Windows startup", type:"bool", def:"0"}
 ]
 
-Sections := ["Translator","LayoutFix","TypoFix","Rainbow","Push","Pin","Custom","Security","General"]
+; Section -> friendly caption, used for the nested sub-tabs.
 TabNames := Map("Translator","Translator", "LayoutFix","Layout Fix", "TypoFix","Typo Fix",
-                "Rainbow","Rainbow", "Push","For Devs", "Pin","Pin",
-                "Custom","Custom", "Security","Security", "General","General")
+                "Rainbow","Rainbow", "Pin","Pin")
+
+; Top-level settings tabs, in order. Each page lists the Schema section(s) it
+; shows. A page with one section renders that section directly; a page with
+; several renders them as nested sub-tabs:
+;   Text   -> Translator / Layout Fix / Typo Fix   (all transform a selection)
+;   Screen -> Rainbow / Pin                         (always-on-top overlays)
+; INI section names are unchanged, so existing multitool.ini configs load as-is.
+TabLayout := [
+    {name:"Text",     subs:["Translator","LayoutFix","TypoFix"]},
+    {name:"Screen",   subs:["Rainbow","Pin"]},
+    {name:"For Devs", subs:["Push"]},
+    {name:"Custom",   subs:["Custom"]},
+    {name:"Security", subs:["Security"]},
+    {name:"General",  subs:["General"]}
+]
 
 ; --- the layout map: Latin key char -> Cyrillic char on the same key ---
 ; (this is fixed, not exposed in the settings window)
@@ -495,7 +509,7 @@ Theme_Palette(name) {
 ; ===  SETTINGS WINDOW  ============================================
 ; ==================================================================
 ShowSettings(*) {
-    global g_Set, Ctrls, Labels, Schema, Sections, TabNames, C
+    global g_Set, Ctrls, Labels, Schema, TabLayout, TabNames, C
 
     if IsObject(g_Set) {
         try {
@@ -513,48 +527,32 @@ ShowSettings(*) {
     g.SetFont("s10 c" t.fg, "Segoe UI")
     g_Set := g
 
-    tab := g.AddTab3("x10 y10 w600 h378", [TabNames["Translator"], TabNames["LayoutFix"],
-        TabNames["TypoFix"], TabNames["Rainbow"], TabNames["Push"], TabNames["Pin"],
-        TabNames["Custom"], TabNames["Security"], TabNames["General"]])
+    names := []
+    for page in TabLayout
+        names.Push(page.name)
+    tab := g.AddTab3("x10 y10 w600 h378", names)
 
     tabIdx := 0
-    for sec in Sections {
+    for page in TabLayout {
         tabIdx++
         tab.UseTab(tabIdx)
-        if (sec = "Custom") {
-            BuildCustomTab(g, t)
-            continue
-        }
-        yPos := 48
-        for item in Schema {
-            if (item.sec != sec)
-                continue
-            k := item.sec "_" item.key
-            val := C.Has(k) ? C[k] : item.def
-
-            if (item.type = "bool") {
-                cb := g.AddCheckbox("x28 y" yPos " w470", item.label)
-                cb.Value := (val = "1") ? 1 : 0
-                Ctrls[k] := cb
-            } else {
-                lbl := g.AddText("x28 y" (yPos + 3) " w175", item.label ":")
-                Labels[k] := lbl
-                if (item.type = "choice") {
-                    dd := g.AddDropDownList("x210 y" yPos " w200 Background" t.editBg, item.choices)
-                    dd.Text := val
-                    Ctrls[k] := dd
-                } else {
-                    w := (InStr(item.key, "Path") || InStr(item.key, "Url")) ? 300 : (item.type = "hotkey" ? 150 : 200)
-                    ed := g.AddEdit("x210 y" yPos " w" w " Background" t.editBg, val)
-                    Ctrls[k] := ed
-                }
+        if (page.subs.Length = 1) {
+            ; One tool on this tab -- render it straight onto the page.
+            RenderSection(g, t, page.subs[1], 48)
+        } else {
+            ; Several related tools -- give each its own nested sub-tab.
+            subNames := []
+            for sec in page.subs
+                subNames.Push(TabNames[sec])
+            sub := g.AddTab3("x16 y42 w588 h342", subNames)
+            subIdx := 0
+            for sec in page.subs {
+                subIdx++
+                sub.UseTab(subIdx)
+                RenderSection(g, t, sec, 78)
             }
-            yPos += 31
+            sub.UseTab(0)
         }
-        if (sec = "Translator")
-            ExtendTranslatorTab(g, t, &yPos)
-        if (sec = "Security")
-            ExtendSecurityTab(g, t, &yPos)
     }
     tab.UseTab(0)
 
@@ -584,6 +582,51 @@ ShowSettings(*) {
     g.OnEvent("Close", (*) => g.Destroy())
     g.OnEvent("Escape", (*) => g.Destroy())
     g.Show("w620 h468")
+}
+
+; Render one Schema section's controls onto the current (sub-)tab page,
+; starting at vertical position yStart. Shared by the single-tool tabs
+; (yStart 48) and the nested sub-tabs (yStart 78, leaving room for the
+; inner tab strip). The Custom grid and the Translator / Security extras
+; are handled as special cases, exactly as before the tabs were merged.
+RenderSection(g, t, sec, yStart) {
+    global Ctrls, Labels, Schema, C
+
+    if (sec = "Custom") {
+        BuildCustomTab(g, t)
+        return
+    }
+
+    yPos := yStart
+    for item in Schema {
+        if (item.sec != sec)
+            continue
+        k := item.sec "_" item.key
+        val := C.Has(k) ? C[k] : item.def
+
+        if (item.type = "bool") {
+            cb := g.AddCheckbox("x28 y" yPos " w470", item.label)
+            cb.Value := (val = "1") ? 1 : 0
+            Ctrls[k] := cb
+        } else {
+            lbl := g.AddText("x28 y" (yPos + 3) " w175", item.label ":")
+            Labels[k] := lbl
+            if (item.type = "choice") {
+                dd := g.AddDropDownList("x210 y" yPos " w200 Background" t.editBg, item.choices)
+                dd.Text := val
+                Ctrls[k] := dd
+            } else {
+                w := (InStr(item.key, "Path") || InStr(item.key, "Url")) ? 300 : (item.type = "hotkey" ? 150 : 200)
+                ed := g.AddEdit("x210 y" yPos " w" w " Background" t.editBg, val)
+                Ctrls[k] := ed
+            }
+        }
+        yPos += 31
+    }
+    if (sec = "Translator")
+        ExtendTranslatorTab(g, t, &yPos)
+    if (sec = "Security")
+        ExtendSecurityTab(g, t, &yPos)
 }
 
 ; After the Translator section renders, drop a help link below the API
