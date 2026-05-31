@@ -3,3 +3,4 @@
 scikit-learn>=1.3
 numpy>=1.24
 pynput>=1.7
+skops>=0.9          # safe (non-pickle) load/save of the typing profile

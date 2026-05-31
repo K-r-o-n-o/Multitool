@@ -4,6 +4,8 @@
 multitool.ini
 
 # Your personal keystroke-biometric profile, written by `sentinel.py enroll`.
+sentinel_profile.skops
+*.skops
 sentinel_profile.pkl
 *.pkl
 

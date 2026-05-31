@@ -312,20 +312,38 @@ CheckForUpdates(interactive) {
         return
     }
 
-    ; Pick the first .exe asset (caller can host multiple files, we just
-    ; want the binary).
-    assetUrl := ""
-    if RegExMatch(json, '"browser_download_url"\s*:\s*"([^"]+\.exe)"', &am)
+    ; Look only inside the release's "assets" array -- never the free-text
+    ; release notes -- so a crafted notes body can't smuggle in a download URL.
+    assetsBlock := json
+    if (ap := InStr(json, '"assets":[')) {
+        endA := InStr(json, '"tarball_url"', , ap)
+        assetsBlock := endA ? SubStr(json, ap, endA - ap) : SubStr(json, ap)
+    }
+
+    ; Pick the first .exe asset and, if GitHub recorded one, its SHA-256 digest.
+    assetUrl := "", assetSha := ""
+    if RegExMatch(assetsBlock, '"browser_download_url"\s*:\s*"([^"]+\.exe)"', &am)
         assetUrl := am[1]
+    if RegExMatch(assetsBlock, 'i)"digest"\s*:\s*"sha256:([0-9a-f]{64})"', &dm)
+        assetSha := dm[1]
     if (assetUrl = "") {
         if interactive
             MsgBox("Release v" latest " is missing a .exe asset.", "MultiTool", "Icon!")
         return
     }
+    ; The installer must come from GitHub's own HTTPS hosts. This stops a
+    ; malformed or partly attacker-influenced response from pointing the
+    ; download at an arbitrary server.
+    if !IsGitHubDownload(assetUrl) {
+        if interactive
+            MsgBox("Refusing to download the update: the asset URL is not on a "
+                "trusted GitHub host.`n`n" assetUrl, "MultiTool", "Icon!")
+        return
+    }
 
     mode := CfgS("General_UpdatesMode")
     if (mode = "Auto") {
-        DoSelfUpdate(assetUrl, latest, interactive)
+        DoSelfUpdate(assetUrl, assetSha, latest, interactive)
         return
     }
     if interactive {
@@ -333,7 +351,7 @@ CheckForUpdates(interactive) {
             "`n`nDownload and install now? MultiTool will restart.",
             "MultiTool Update", "YesNo Iconi")
         if (r = "Yes")
-            DoSelfUpdate(assetUrl, latest, true)
+            DoSelfUpdate(assetUrl, assetSha, latest, true)
         return
     }
     ; Notify mode + automatic check on startup
@@ -358,16 +376,26 @@ CompareVersions(a, b) {
     return 0
 }
 
-DoSelfUpdate(assetUrl, newVersion, interactive) {
+DoSelfUpdate(assetUrl, expectedSha, newVersion, interactive) {
     if !A_IsCompiled {
         if interactive
             MsgBox("Auto-update only works for the compiled .exe build.",
                 "MultiTool", "Icon!")
         return
     }
+    ; Defense in depth: never fetch the binary from anywhere but GitHub.
+    if !IsGitHubDownload(assetUrl) {
+        if interactive
+            MsgBox("Refusing to download the update from an untrusted host.",
+                "MultiTool", "Icon!")
+        return
+    }
     target  := A_ScriptFullPath
-    tempExe := A_Temp "\MultiTool.update.exe"
-    tempBat := A_Temp "\MultiTool.update.bat"
+    ; Randomized temp names so another local process can't pre-create or swap
+    ; the staged installer / batch at a predictable path between write and run.
+    rnd     := Format("{:08x}{:08x}", Random(0, 0xFFFFFFFF), Random(0, 0xFFFFFFFF))
+    tempExe := A_Temp "\MultiTool.update." rnd ".exe"
+    tempBat := A_Temp "\MultiTool.update." rnd ".bat"
 
     try {
         req := ComObject("WinHttp.WinHttpRequest.5.1")
@@ -386,6 +414,22 @@ DoSelfUpdate(assetUrl, newVersion, interactive) {
         if interactive
             MsgBox("Download failed:`n`n" e.Message, "MultiTool", "Icon!")
         return
+    }
+
+    ; Verify the download against the SHA-256 GitHub recorded for the asset,
+    ; so a corrupted or swapped file is rejected before we run it. This is an
+    ; integrity check, not a publisher signature -- if you start signing your
+    ; releases, add an Authenticode (WinVerifyTrust) check here as well.
+    if (expectedSha != "") {
+        actualSha := FileSHA256(tempExe)
+        if (actualSha = "" || actualSha != StrLower(expectedSha)) {
+            try FileDelete(tempExe)
+            if interactive
+                MsgBox("Update integrity check failed -- the downloaded file's "
+                    "hash does not match the release. Aborting update.",
+                    "MultiTool", "Icon!")
+            return
+        }
     }
 
     ; A tiny batch waits for the current .exe to release the file, swaps
@@ -407,6 +451,35 @@ DoSelfUpdate(assetUrl, newVersion, interactive) {
 
     Run('"' tempBat '"', , "Hide")
     ExitApp()
+}
+
+; True only if `url` is an HTTPS download whose host is exactly github.com or a
+; *.githubusercontent.com host (where GitHub serves release assets). Rejecting
+; everything else -- including userinfo tricks like https://github.com@evil/ --
+; keeps the updater from being redirected to an attacker-controlled server.
+IsGitHubDownload(url) {
+    if !RegExMatch(url, 'i)^https://([^/?#@]+)(?:[/?#]|$)', &m)
+        return false
+    host := StrLower(m[1])
+    return (host = "github.com") || RegExMatch(host, 'i)(^|\.)githubusercontent\.com$')
+}
+
+; SHA-256 of a file as lowercase hex (via certutil, present on every Windows),
+; or "" on failure. Whitespace is stripped so both the spaced (legacy) and the
+; contiguous certutil hash layouts parse.
+FileSHA256(path) {
+    tmp := A_Temp "\multitool_hash_" Format("{:08x}", Random(0, 0xFFFFFFFF)) ".txt"
+    try FileDelete(tmp)
+    try RunWait(A_ComSpec ' /c "certutil -hashfile "' path '" SHA256 > "' tmp '" 2>nul"', , "Hide")
+    out := ""
+    try out := FileRead(tmp)
+    try FileDelete(tmp)
+    for line in StrSplit(out, "`n", "`r") {
+        h := RegExReplace(Trim(line), "\s")
+        if RegExMatch(h, "i)^[0-9a-f]{64}$")
+            return StrLower(h)
+    }
+    return ""
 }
 
 
@@ -1981,8 +2054,8 @@ SentinelScript() {
     return A_ScriptDir "\sentinel.py"
 }
 SentinelProfile() {
-    ; Matches MODEL_PATH in sentinel.py (pickle saved beside the script).
-    return A_ScriptDir "\sentinel_profile.pkl"
+    ; Matches MODEL_PATH in sentinel.py (skops profile saved beside the script).
+    return A_ScriptDir "\sentinel_profile.skops"
 }
 Sec_Python() {
     p := Trim(CfgS("Security_PythonPath"))

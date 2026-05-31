@@ -31,7 +31,6 @@ Dependencies:  pip install scikit-learn numpy pynput
 import sys
 import os
 import time
-import pickle
 import platform
 import statistics
 from collections import deque
@@ -48,7 +47,7 @@ CONSEC_TO_LOCK = 6    # consecutive anomalous windows required before locking
                       # (sliding windows overlap and are autocorrelated, so this
                       #  needs to be fairly high to avoid false locks)
 COOLDOWN_SEC = 30     # after a lock, wait before arming again
-MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sentinel_profile.pkl")
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sentinel_profile.skops")
 
 
 # ----------------------------------------------------------------------------
@@ -209,9 +208,11 @@ def enroll():
     scores = model.decision_function(Xs)
     threshold = float(np.percentile(scores, 1))
 
-    with open(MODEL_PATH, "wb") as fh:
-        pickle.dump({"model": model, "scaler": scaler, "threshold": threshold,
-                     "window": WINDOW, "stride": STRIDE}, fh)
+    # Persist with skops, not pickle: the profile is data, and skops stores it
+    # in a format that does not execute code when it is later loaded back.
+    import skops.io as sio
+    sio.dump({"model": model, "scaler": scaler, "threshold": threshold,
+              "window": WINDOW, "stride": STRIDE}, MODEL_PATH)
 
     print(f"\n\nProfile trained on {len(X)} windows.")
     print(f"Anomaly threshold: {threshold:.4f}")
@@ -226,8 +227,17 @@ def monitor():
     if not os.path.exists(MODEL_PATH):
         print("No profile found. Run 'python sentinel.py enroll' first.")
         return
-    with open(MODEL_PATH, "rb") as fh:
-        data = pickle.load(fh)
+    # Load with skops. Unlike pickle, skops.io.load does NOT run arbitrary code:
+    # with the default trusted=False it instantiates only a built-in allow-list
+    # of scikit-learn / numpy types, so a tampered profile file can't execute
+    # code at load time. A profile that fails this check is refused outright.
+    import skops.io as sio
+    try:
+        data = sio.load(MODEL_PATH)
+    except Exception as e:
+        print(f"Could not load profile ({e}).")
+        print("Re-enroll a trusted profile with 'python sentinel.py enroll'.")
+        return
     model, scaler, threshold = data["model"], data["scaler"], data["threshold"]
 
     print("=" * 64)
