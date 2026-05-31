@@ -43,7 +43,7 @@ try DllCall("SetThreadDpiAwarenessContext", "ptr", -4)   ; PER_MONITOR_AWARE_V2
 INI := A_ScriptDir "\multitool.ini"
 
 ; --- bump this when you publish a new GitHub release ---
-APP_VERSION := "1.1.2"
+APP_VERSION := "1.2.0"
 GITHUB_REPO := "K-r-o-n-o/Multitool"
 
 
@@ -95,6 +95,7 @@ Schema := [
     {sec:"Push",       key:"Branch",  label:"Branch",              type:"string", def:""},
     {sec:"Push",       key:"Msg",     label:"Commit message",      type:"string", def:"auto-push via script"},
     {sec:"Push",       key:"Shell",   label:"Terminal",            type:"choice", def:"cmd", choices:["cmd","powershell"]},
+    {sec:"Push",       key:"Token",   label:"GitHub token",        type:"string", def:""},
 
     {sec:"Pin",        key:"HotkeyPin",   label:"Pin (click-through)", type:"hotkey", def:"#t"},
     {sec:"Pin",        key:"HotkeyUnpin", label:"Unpin all",           type:"hotkey", def:"#c"},
@@ -681,7 +682,10 @@ RenderSection(g, t, sec, yStart) {
                 Ctrls[k] := dd
             } else {
                 w := (InStr(item.key, "Path") || InStr(item.key, "Url")) ? 300 : (item.type = "hotkey" ? 150 : 200)
-                ed := g.AddEdit("x210 y" yPos " w" w " Background" t.editBg, val)
+                eOpt := "x210 y" yPos " w" w " Background" t.editBg
+                if InStr(item.key, "Token")            ; mask secrets on screen
+                    eOpt .= " Password"
+                ed := g.AddEdit(eOpt, val)
                 Ctrls[k] := ed
             }
         }
@@ -692,6 +696,8 @@ RenderSection(g, t, sec, yStart) {
         refresh := ExtendTranslatorTab(g, t, &yPos)
     if (sec = "Security")
         ExtendSecurityTab(g, t, &yPos)
+    if (sec = "Push")
+        ExtendPushTab(g, t, &yPos)
     return refresh
 }
 
@@ -754,6 +760,24 @@ ExtendSecurityTab(g, t, &yPos) {
     g.AddText("x28 y" yPos " w540",
         "Needs Python on this PC with: scikit-learn, numpy, pynput  "
         "(pip install -r requirements.txt).")
+    g.SetFont("s10 c" t.fg, "Segoe UI")
+}
+
+; After the For Devs (git push) rows render, add a "Create a release" button.
+; The release is published from the app -- via the GitHub CLI if it's logged
+; in, else the GitHub token above -- with the browser only as a fallback.
+ExtendPushTab(g, t, &yPos) {
+    yPos += 10
+    g.SetFont("s10 c" t.fg, "Segoe UI")
+    g.AddButton("x28 y" yPos " w200 h28", "Create a release...")
+        .OnEvent("Click", (*) => DoRelease())
+
+    g.SetFont("s9 c" t.hintFg, "Segoe UI")
+    g.AddText("x240 y" (yPos + 4) " w344",
+        "Publishes a GitHub release (tag, notes, files) on the Branch above, via "
+        "GitHub CLI or your token -- no browser needed. The token is stored in "
+        "multitool.ini in plain text.")
+    yPos += 50
     g.SetFont("s10 c" t.fg, "Segoe UI")
 }
 
@@ -1591,6 +1615,324 @@ GetOriginUrl(folder) {
         try FileDelete(tmp)
         return ""
     }
+}
+
+; Entry point for the "Create a release" button. Resolves the GitHub repo the
+; same way a push does (explicit Repo URL, else the folder's origin), makes
+; sure we can authenticate, then opens the release dialog. With no auth set up
+; it offers the browser release page as a fallback.
+DoRelease() {
+    repoUrl := Trim(CfgS("Push_RepoUrl"))
+    path    := CfgS("Push_Path")
+    effective := (repoUrl != "") ? repoUrl : GetOriginUrl(path)
+
+    if (effective = "") {
+        MsgBox("No repository to release.`n`nSet a Repo URL on the For Devs tab, "
+            "or pick a project folder that has a GitHub 'origin' remote.",
+            "MultiTool", "Icon!")
+        return
+    }
+    repo := ParseGitHubRepo(effective)
+    if (repo = "") {
+        MsgBox("This doesn't look like a GitHub repository:`n`n" effective "`n`n"
+            "Releases can only be created on github.com.", "MultiTool", "Icon!")
+        return
+    }
+
+    if (!Gh_Available() && Trim(CfgS("Push_Token")) = "") {
+        r := MsgBox("Publishing a release needs GitHub authentication.`n`n"
+            "Install GitHub CLI and run `"gh auth login`", or add a GitHub token "
+            "in Settings -> For Devs.`n`nOpen the release page in your browser instead?",
+            "Create a release", "YesNo Icon!")
+        if (r = "Yes")
+            Run(ReleasesNewUrl(effective))
+        return
+    }
+
+    ShowReleaseDialog(repo, Trim(CfgS("Push_Branch")))
+}
+
+; The release form: tag, title, description, file attachments, and the draft /
+; pre-release flags. On OK it publishes via PublishRelease and reports back
+; with a modal success or failure message.
+ShowReleaseDialog(repo, target) {
+    t := Theme_Palette(CfgS("General_Theme"))
+    files := []
+    pending := ""        ; the opts object handed from OnOk to Publish
+
+    d := Gui("+OwnDialogs -Resize -MaximizeBox", "Create a release")
+    d.BackColor := t.bg
+    d.SetFont("s10 c" t.fg, "Segoe UI")
+
+    d.AddText("x14 y12 w456", "Repository:   " repo)
+    d.AddText("x14 y34 w456", "Target branch:   " (target = "" ? "(repo default)" : target))
+
+    d.AddText("x14 y70 w90", "Tag")
+    tagEd := d.AddEdit("x110 y66 w180 Background" t.editBg)
+    d.SetFont("s9 c" t.hintFg, "Segoe UI")
+    d.AddText("x298 y70 w172", "required, e.g. v1.2.0")
+    d.SetFont("s10 c" t.fg, "Segoe UI")
+
+    d.AddText("x14 y104 w90", "Title")
+    titleEd := d.AddEdit("x110 y100 w360 Background" t.editBg)
+    d.SetFont("s9 c" t.hintFg, "Segoe UI")
+    d.AddText("x110 y124 w360", "optional -- defaults to the tag")
+    d.SetFont("s10 c" t.fg, "Segoe UI")
+
+    d.AddText("x14 y150 w90", "Description")
+    descEd := d.AddEdit("x110 y150 w360 r6 +Multi +WantReturn Background" t.editBg)
+
+    d.AddText("x14 y272 w90", "Files")
+    filesLb := d.AddListBox("x110 y272 w360 h78 Background" t.editBg)
+    d.AddButton("x110 y354 w114 h26", "Add files...").OnEvent("Click", AddFiles)
+    d.AddButton("x232 y354 w114 h26", "Remove").OnEvent("Click", RemoveFile)
+
+    draftCb := d.AddCheckbox("x110 y390 w90", "Draft")
+    preCb   := d.AddCheckbox("x210 y390 w140", "Pre-release")
+
+    statusTx := d.AddText("x14 y424 w330 c" t.hintFg, "")
+    okBtn := d.AddButton("x352 y420 w56 h28 +Default", "OK")
+    d.AddButton("x412 y420 w56 h28", "Cancel").OnEvent("Click", (*) => d.Destroy())
+
+    okBtn.OnEvent("Click", OnOk)
+    d.OnEvent("Close", (*) => d.Destroy())
+    d.OnEvent("Escape", (*) => d.Destroy())
+    d.Show("w484 h462")
+
+    AddFiles(*) {
+        sel := FileSelect("M3", , "Choose files to attach to the release")
+        if (sel = "")                          ; cancelled
+            return
+        picks := IsObject(sel) ? sel : [sel]   ; v2 multi-select returns an array of full paths
+        for f in picks {
+            dup := false
+            for existing in files
+                if (existing = f)
+                    dup := true
+            if !dup {
+                files.Push(f)
+                SplitPath(f, &fn)
+                filesLb.Add([fn])
+            }
+        }
+    }
+    RemoveFile(*) {
+        i := filesLb.Value
+        if (i > 0) {
+            files.RemoveAt(i)
+            filesLb.Delete(i)
+        }
+    }
+    OnOk(*) {
+        tag := Trim(tagEd.Value)
+        if (tag = "") {
+            MsgBox("A tag is required (for example v1.2.0).", "Create a release", "Icon!")
+            return
+        }
+        pending := {tag: tag, title: Trim(titleEd.Value), body: descEd.Value,
+                    files: files, draft: draftCb.Value ? true : false,
+                    prerelease: preCb.Value ? true : false, target: target}
+        okBtn.Enabled := false
+        statusTx.Text := "Publishing release..."
+        SetTimer(Publish, -50)   ; defer so the status text paints before we block
+    }
+
+    Publish() {
+        res := PublishRelease(repo, pending)
+        if (res.ok) {
+            d.Destroy()
+            msg := "Released successfully."
+            if (res.url != "")
+                msg .= "`n`n" res.url
+            MsgBox(msg, "MultiTool", "Iconi")
+        } else {
+            okBtn.Enabled := true
+            statusTx.Text := ""
+            MsgBox("Release failed:`n`n" res.error, "Create a release", "Icon!")
+        }
+    }
+}
+
+; Pick an auth method (gh if it's logged in, else the saved token) and publish.
+PublishRelease(repo, opts) {
+    if Gh_Available()
+        return Gh_CreateRelease(repo, opts)
+    token := Trim(CfgS("Push_Token"))
+    if (token != "")
+        return Api_CreateRelease(repo, token, opts)
+    return {ok: false, url: "", error: "No GitHub authentication available "
+        "(GitHub CLI is not logged in and no token is set)."}
+}
+
+; True if the GitHub CLI is installed AND authenticated for github.com.
+Gh_Available() {
+    try return RunWait(A_ComSpec ' /c "gh auth status >nul 2>&1"', , "Hide") = 0
+    catch
+        return false
+}
+
+; Publish via `gh release create`: gh creates the tag on --target, uploads the
+; files and prints the release URL. Returns {ok, url, error}.
+Gh_CreateRelease(repo, opts) {
+    notes := A_Temp "\multitool_notes.txt"
+    outF  := A_Temp "\multitool_ghrel_out.txt"
+    errF  := A_Temp "\multitool_ghrel_err.txt"
+    try FileDelete(notes)
+    FileAppend(opts.body, notes, "UTF-8-RAW")
+
+    title := (opts.title != "") ? opts.title : opts.tag
+    cmd := 'gh release create "' opts.tag '"'
+    for f in opts.files
+        cmd .= ' "' f '"'
+    cmd .= ' --repo "' repo '" --title "' title '" --notes-file "' notes '"'
+    if (opts.target != "")
+        cmd .= ' --target "' opts.target '"'
+    if opts.draft
+        cmd .= ' --draft'
+    if opts.prerelease
+        cmd .= ' --prerelease'
+
+    workDir := DirExist(CfgS("Push_Path")) ? CfgS("Push_Path") : A_ScriptDir
+    try FileDelete(outF)
+    try FileDelete(errF)
+    code := RunWait(A_ComSpec ' /c "' cmd ' > "' outF '" 2> "' errF '""', workDir, "Hide")
+
+    out := FileExist(outF) ? FileRead(outF) : ""
+    err := FileExist(errF) ? FileRead(errF) : ""
+    try FileDelete(notes)
+    try FileDelete(outF)
+    try FileDelete(errF)
+
+    if (code = 0) {
+        url := RegExMatch(out "`n" err, "i)https://github\.com/\S+/releases/tag/\S+", &m)
+            ? Trim(m[0], "`r`n `t") : ""
+        return {ok: true, url: url, error: ""}
+    }
+    msg := Trim((err != "") ? err : out, "`r`n `t")
+    return {ok: false, url: "", error: (msg != "") ? msg : "gh exited with code " code}
+}
+
+; Publish via the GitHub REST API with a token: create the release, then upload
+; each file as a release asset. Returns {ok, url, error}.
+Api_CreateRelease(repo, token, opts) {
+    parts := StrSplit(repo, "/")
+    owner := parts[1], name := parts[2]
+    title := (opts.title != "") ? opts.title : opts.tag
+
+    body := '{"tag_name":"' JsonEsc(opts.tag) '"'
+    if (opts.target != "")
+        body .= ',"target_commitish":"' JsonEsc(opts.target) '"'
+    body .= ',"name":"' JsonEsc(title) '"'
+    body .= ',"body":"' JsonEsc(opts.body) '"'
+    body .= ',"draft":' (opts.draft ? "true" : "false")
+    body .= ',"prerelease":' (opts.prerelease ? "true" : "false") '}'
+
+    try {
+        req := ComObject("WinHttp.WinHttpRequest.5.1")
+        req.Open("POST", "https://api.github.com/repos/" owner "/" name "/releases", false)
+        Api_Headers(req, token)
+        req.SetRequestHeader("Content-Type", "application/json; charset=utf-8")
+        req.Send(body)
+    } catch as e {
+        return {ok: false, url: "", error: "Network error: " e.Message}
+    }
+    if (req.Status != 201)
+        return {ok: false, url: "", error: Api_ErrMsg(req)}
+
+    json := ReadUtf8Body(req)
+    id  := RegExMatch(json, '"id":\s*(\d+)', &m) ? m[1] : ""
+    url := RegExMatch(json, '"html_url":\s*"([^"]+/releases/tag/[^"]+)"', &m) ? m[1] : ""
+
+    failed := ""
+    for f in opts.files {
+        ur := Api_UploadAsset(owner, name, token, id, f)
+        if !ur.ok
+            failed .= "`n  " f " -- " ur.error
+    }
+    if (failed != "")
+        return {ok: false, url: url, error: "Release created, but some files "
+            "could not be uploaded:" failed}
+    return {ok: true, url: url, error: ""}
+}
+
+; Upload one file as an asset of release `id`.
+Api_UploadAsset(owner, name, token, id, file) {
+    if (id = "")
+        return {ok: false, error: "no release id"}
+    if !FileExist(file)
+        return {ok: false, error: "file not found"}
+    SplitPath(file, &fn)
+    url := "https://uploads.github.com/repos/" owner "/" name "/releases/" id
+        . "/assets?name=" UriEncode(fn)
+    try {
+        stream := ComObject("ADODB.Stream")
+        stream.Type := 1                 ; binary
+        stream.Open()
+        stream.LoadFromFile(file)
+        stream.Position := 0
+        data := stream.Read()
+        stream.Close()
+
+        req := ComObject("WinHttp.WinHttpRequest.5.1")
+        req.Open("POST", url, false)
+        Api_Headers(req, token)
+        req.SetRequestHeader("Content-Type", "application/octet-stream")
+        req.Send(data)
+    } catch as e {
+        return {ok: false, error: e.Message}
+    }
+    return (req.Status = 201) ? {ok: true, error: ""} : {ok: false, error: Api_ErrMsg(req)}
+}
+
+Api_Headers(req, token) {
+    req.SetRequestHeader("Authorization", "Bearer " token)
+    req.SetRequestHeader("Accept", "application/vnd.github+json")
+    req.SetRequestHeader("X-GitHub-Api-Version", "2022-11-28")
+    req.SetRequestHeader("User-Agent", "MultiTool")
+}
+
+; Build a readable error string from a failed GitHub API response.
+Api_ErrMsg(req) {
+    body := ""
+    try body := ReadUtf8Body(req)
+    msg := RegExMatch(body, '"message":\s*"((?:\\.|[^"\\])*)"', &m) ? Unescape(m[1]) : ""
+    return "GitHub API " req.Status (msg != "" ? " -- " msg : "")
+}
+
+; JSON-string-escape for the REST request body. Backslash first, then quotes,
+; then the whitespace controls.
+JsonEsc(s) {
+    s := StrReplace(s, "\", "\\")
+    s := StrReplace(s, '"', '\"')
+    s := StrReplace(s, "`r`n", "\n")
+    s := StrReplace(s, "`r", "\n")
+    s := StrReplace(s, "`n", "\n")
+    s := StrReplace(s, "`t", "\t")
+    return s
+}
+
+; "owner/repo" from a git remote (https or SSH, optional creds / .git), or ""
+; if it isn't a recognizable github.com repository.
+ParseGitHubRepo(remote) {
+    remote := Trim(remote)
+    if RegExMatch(remote, "i)^git@github\.com:(.+)$", &m)
+        repoPath := m[1]
+    else if RegExMatch(remote, "i)^ssh://git@github\.com/(.+)$", &m)
+        repoPath := m[1]
+    else if RegExMatch(remote, "i)^https?://(?:[^/@]+@)?github\.com/(.+)$", &m)
+        repoPath := m[1]
+    else
+        return ""
+    repoPath := RegExReplace(repoPath, "i)\.git$", "")
+    repoPath := RegExReplace(repoPath, "/+$", "")
+    return RegExMatch(repoPath, "^[^/]+/[^/]+$") ? repoPath : ""
+}
+
+; The repo's https://github.com/<owner>/<repo>/releases/new page (browser
+; fallback), or "" if `remote` isn't a recognizable GitHub remote.
+ReleasesNewUrl(remote) {
+    repo := ParseGitHubRepo(remote)
+    return (repo = "") ? "" : "https://github.com/" repo "/releases/new"
 }
 
 
