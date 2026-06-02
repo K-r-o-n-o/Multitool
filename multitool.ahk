@@ -43,7 +43,7 @@ try DllCall("SetThreadDpiAwarenessContext", "ptr", -4)   ; PER_MONITOR_AWARE_V2
 INI := A_ScriptDir "\multitool.ini"
 
 ; --- bump this when you publish a new GitHub release ---
-APP_VERSION := "1.2.1"
+APP_VERSION := "1.3.0"
 GITHUB_REPO := "K-r-o-n-o/Multitool"
 
 
@@ -104,6 +104,12 @@ Schema := [
     {sec:"Security",   key:"Enabled",      label:"Enable keystroke sentinel", type:"bool",   def:"0"},
     {sec:"Security",   key:"HotkeyToggle", label:"Toggle sentinel",           type:"hotkey", def:""},
     {sec:"Security",   key:"PythonPath",   label:"Python executable",         type:"string", def:"python"},
+    {sec:"Access",     key:"HelloGate",    label:"Require Windows Hello", type:"bool", def:"0"},
+    {sec:"Access",     key:"PossessMode",  label:"Lock when away", type:"choice", def:"Off",
+        choices:["Off","USB","Bluetooth","Both"]},
+    {sec:"Access",     key:"PossessUsb",   label:"USB key id",        type:"string", def:""},
+    {sec:"Access",     key:"PossessBt",    label:"Bluetooth device",  type:"string", def:""},
+    {sec:"Access",     key:"PossessGrace", label:"Lock after absent (s)", type:"int", def:"15"},
 
     {sec:"Custom", key:"Hotkey1", label:"#1", type:"hotkey", def:""},
     {sec:"Custom", key:"Type1",   label:"#1", type:"choice", def:"Run", choices:["Run","Paste"]},
@@ -125,12 +131,14 @@ Schema := [
     {sec:"General",    key:"UpdatesMode",    label:"Updates",        type:"choice", def:"Notify",        choices:["Off","Notify","Auto"]},
     {sec:"General",    key:"HotkeyQuit",     label:"Quit MultiTool", type:"hotkey", def:"^#q"},
     {sec:"General",    key:"HotkeySettings", label:"Open Settings",  type:"hotkey", def:"^#s"},
-    {sec:"General",    key:"RunOnStartup",   label:"Run on Windows startup", type:"bool", def:"0"}
+    {sec:"General",    key:"RunOnStartup",   label:"Run on Windows startup", type:"bool", def:"0"},
+    {sec:"General",    key:"ClipClearSec",   label:"Clear clipboard after (s, 0=off)", type:"int", def:"60"},
+    {sec:"General",    key:"AuditLog",       label:"Log security events", type:"bool", def:"1"}
 ]
 
 ; Section -> friendly caption, used for the nested sub-tabs.
 TabNames := Map("Translator","Translator", "LayoutFix","Layout Fix", "TypoFix","Typo Fix",
-                "Rainbow","Rainbow", "Pin","Pin")
+                "Rainbow","Rainbow", "Pin","Pin", "Security","Sentinel", "Access","Access")
 
 ; Top-level settings tabs, in order. Each page lists the Schema section(s) it
 ; shows. A page with one section renders that section directly; a page with
@@ -143,7 +151,7 @@ TabLayout := [
     {name:"Screen",   subs:["Rainbow","Pin"]},
     {name:"For Devs", subs:["Push"]},
     {name:"Custom",   subs:["Custom"]},
-    {name:"Security", subs:["Security"]},
+    {name:"Security", subs:["Security","Access"]},
     {name:"General",  subs:["General"]}
 ]
 
@@ -173,6 +181,7 @@ Popup    := ""          ; translator popup
 popupGui := 0           ; layout-fix popup
 popupGen := 0
 PinnedWindows := Map()  ; hwnd -> true (currently click-through)
+g_ClipGuard := ""       ; last text we auto-copied; cleared on timeout if unchanged
 
 ; rainbow-border module state (b* prefix)
 bBuilt := false, bActive := false
@@ -196,6 +205,7 @@ RegisterHotkeys()
 SetupTray()
 OnExit(OnExitHandler)
 Sec_Apply(false)   ; resume the keystroke sentinel if it was left enabled
+Possess_Apply()    ; arm the possession-factor poll if configured
 TrayTip("Right-click the tray icon -> Settings to configure.", "MultiTool loaded")
 
 ; Background update check 5 s after startup so it doesn't slow boot.
@@ -221,8 +231,20 @@ LoadConfig() {
     MigrateIni()
     for item in Schema {
         k := item.sec "_" item.key
-        C[k] := IniRead(INI, item.sec, item.key, item.def)
+        v := IniRead(INI, item.sec, item.key, item.def)
+        ; Secrets are stored encrypted ("dpapi:<base64>"); decrypt into the live
+        ; config so the rest of the app sees plain text transparently. A blob we
+        ; can't decrypt (copied from another user/PC) collapses to "".
+        if (IsSecretKey(k) && SubStr(v, 1, 6) = "dpapi:")
+            v := Dpapi_Unprotect(SubStr(v, 7))
+        C[k] := v
     }
+}
+
+; Settings whose values are sensitive and must never sit in the INI as plain
+; text. They are DPAPI-encrypted on save and decrypted on load.
+IsSecretKey(k) {
+    return (k = "Push_Token" || k = "Translator_DeepLKey")
 }
 
 ; v1.0.x stored the git auto-push settings under [Deploy]. v1.1 renamed the
@@ -251,9 +273,213 @@ SaveConfig() {
     global C, Schema, INI
     for item in Schema {
         k := item.sec "_" item.key
-        IniWrite(C[k], INI, item.sec, item.key)
+        v := C[k]
+        if (IsSecretKey(k) && v != "") {
+            enc := Dpapi_Protect(v)
+            v := (enc != "") ? "dpapi:" enc : v   ; if encryption fails, store as-is
+        }
+        IniWrite(v, INI, item.sec, item.key)
     }
 }
+
+; ==================================================================
+; ===  SECRETS AT REST (DPAPI)  ====================================
+; ==================================================================
+; Wrap/unwrap a string with Windows DPAPI (CryptProtectData), tied to the
+; current Windows user account. The ciphertext is base64 for INI storage and
+; is only decryptable by the same user on the same machine -- so the GitHub
+; token and DeepL key never sit in multitool.ini as readable text.
+Dpapi_Protect(plain) {
+    if (plain = "")
+        return ""
+    inBuf := Buffer(StrPut(plain, "UTF-16"))
+    StrPut(plain, inBuf, "UTF-16")
+    inB := Dpapi_Blob(inBuf.Ptr, inBuf.Size)
+    out := Buffer(2 * A_PtrSize, 0)
+    if !DllCall("crypt32\CryptProtectData", "ptr", inB, "ptr", 0, "ptr", 0,
+                "ptr", 0, "ptr", 0, "uint", 0, "ptr", out)
+        return ""
+    res := Dpapi_TakeBlob(out)
+    return B64Encode(res)
+}
+
+Dpapi_Unprotect(b64) {
+    if (b64 = "")
+        return ""
+    data := B64Decode(b64)
+    if (data.Size = 0)
+        return ""
+    inB := Dpapi_Blob(data.Ptr, data.Size)
+    out := Buffer(2 * A_PtrSize, 0)
+    if !DllCall("crypt32\CryptUnprotectData", "ptr", inB, "ptr", 0, "ptr", 0,
+                "ptr", 0, "ptr", 0, "uint", 0, "ptr", out)
+        return ""
+    res := Dpapi_TakeBlob(out)
+    return StrGet(res.Ptr, "UTF-16")
+}
+
+; Build a DATA_BLOB {DWORD cbData; void* pbData} pointing at existing bytes.
+Dpapi_Blob(ptr, size) {
+    b := Buffer(2 * A_PtrSize, 0)
+    NumPut("uint", size, b, 0)
+    NumPut("ptr", ptr, b, A_PtrSize)
+    return b
+}
+
+; Copy the bytes a Crypt*Data output DATA_BLOB points at into a Buffer, then
+; LocalFree the OS-allocated memory.
+Dpapi_TakeBlob(blob) {
+    cb := NumGet(blob, 0, "uint")
+    pb := NumGet(blob, A_PtrSize, "ptr")
+    res := Buffer(cb)
+    DllCall("RtlMoveMemory", "ptr", res, "ptr", pb, "uptr", cb)
+    DllCall("kernel32\LocalFree", "ptr", pb)
+    return res
+}
+
+B64Encode(buf) {
+    flags := 0x1 | 0x40000000     ; CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF
+    size := 0
+    DllCall("crypt32\CryptBinaryToStringW", "ptr", buf, "uint", buf.Size,
+            "uint", flags, "ptr", 0, "uint*", &size)
+    out := Buffer(size * 2)
+    DllCall("crypt32\CryptBinaryToStringW", "ptr", buf, "uint", buf.Size,
+            "uint", flags, "ptr", out, "uint*", &size)
+    return StrGet(out, "UTF-16")
+}
+
+B64Decode(str) {
+    size := 0
+    DllCall("crypt32\CryptStringToBinaryW", "str", str, "uint", 0, "uint", 0x1,
+            "ptr", 0, "uint*", &size, "ptr", 0, "ptr", 0)
+    out := Buffer(size, 0)
+    DllCall("crypt32\CryptStringToBinaryW", "str", str, "uint", 0, "uint", 0x1,
+            "ptr", out, "uint*", &size, "ptr", 0, "ptr", 0)
+    return out
+}
+
+
+; ==================================================================
+; ===  CLIPBOARD HYGIENE  ==========================================
+; ==================================================================
+; The translator/layout "copy" actions leave their result on the clipboard.
+; Schedule it to be wiped after General -> "Clear clipboard after" seconds, but
+; only if it still holds exactly what we put there -- so we never clobber what
+; the user copied in the meantime. 0 seconds disables this.
+Clip_ScheduleClear(text) {
+    global g_ClipGuard
+    secs := CfgI("General_ClipClearSec")
+    if (secs <= 0 || text = "")
+        return
+    g_ClipGuard := text
+    SetTimer(Clip_DoClear, -secs * 1000)
+}
+
+Clip_DoClear() {
+    global g_ClipGuard
+    if (g_ClipGuard != "" && A_Clipboard = g_ClipGuard) {
+        A_Clipboard := ""
+        Audit("clipboard", "auto-cleared")
+    }
+    g_ClipGuard := ""
+}
+
+
+; ==================================================================
+; ===  AUDIT LOG  ==================================================
+; ==================================================================
+; Append a timestamped security event to multitool_audit.log beside the app
+; when General -> "Log security events" is on. Best-effort -- never throws, and
+; never records secrets (only what happened).
+Audit(event, detail := "") {
+    if (CfgS("General_AuditLog") != "1")
+        return
+    line := FormatTime(, "yyyy-MM-dd HH:mm:ss") "  " event
+        . (detail != "" ? "  " detail : "") "`r`n"
+    try FileAppend(line, A_ScriptDir "\multitool_audit.log", "UTF-8")
+}
+
+
+; ==================================================================
+; ===  WINDOWS HELLO GATE  =========================================
+; ==================================================================
+; Require a Windows Hello check (fingerprint / face / PIN -- whichever the user
+; has enrolled) before a sensitive action, when Security -> "Require Windows
+; Hello" is on. We shell out to a tiny PowerShell helper that drives the WinRT
+; UserConsentVerifier. It FAILS OPEN when Hello isn't set up on this PC or the
+; check errors (so the app can never lock you out of your own machine), and
+; FAILS CLOSED only on an explicit deny/cancel.
+Hello_Gate(label) {
+    if (CfgS("Access_HelloGate") != "1")
+        return true
+    return Hello_Verify(label)
+}
+
+Hello_Verify(message) {
+    ps := Hello_ScriptPath()
+    if (ps = "")
+        return true
+    code := RunWait(Format('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{1}" "{2}"',
+        ps, StrReplace(message, '"', "")), , "Hide")
+    switch code {
+        case 0:
+            Audit("hello", "verified -- " message)
+            return true
+        case 1:
+            Audit("hello", "DENIED -- " message)
+            return false
+        default:   ; 2 = no Hello on this PC, 3 = error -> don't brick the user
+            Audit("hello", "skipped(code " code ") -- " message)
+            return true
+    }
+}
+
+; Stage the PowerShell helper in %TEMP% (rewritten each call so it can't go
+; stale across versions). All string literals use double quotes and no
+; apostrophes/backticks, so each line embeds cleanly as a single-quoted AHK
+; string. Returns the path, or "" if it couldn't be written.
+Hello_ScriptPath() {
+    p := A_Temp "\multitool_hello.ps1"
+    lines := [
+        '$ErrorActionPreference = "Stop"',
+        '$msg = if ($args.Count -ge 1) { $args[0] } else { "Verify your identity" }',
+        'try {',
+        '  [void][Windows.Security.Credentials.UI.UserConsentVerifier, Windows.Security.Credentials.UI, ContentType=WindowsRuntime]',
+        '  Add-Type -AssemblyName System.Runtime.WindowsRuntime',
+        '  $gen = "IAsyncOperation" + [char]96 + "1"',
+        '  $asTask = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq "AsTask" -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq $gen } | Select-Object -First 1',
+        '  function Await($op, $T) { $t = $asTask.MakeGenericMethod($T).Invoke($null, @($op)); $t.Wait(-1) | Out-Null; $t.Result }',
+        '  $availT = [Windows.Security.Credentials.UI.UserConsentVerifierAvailability]',
+        '  $avail = Await ([Windows.Security.Credentials.UI.UserConsentVerifier]::CheckAvailabilityAsync()) $availT',
+        '  if ($avail -ne $availT::Available) { exit 2 }',
+        '  $resT = [Windows.Security.Credentials.UI.UserConsentVerificationResult]',
+        '  $res = Await ([Windows.Security.Credentials.UI.UserConsentVerifier]::RequestVerificationAsync($msg)) $resT',
+        '  if ($res -eq $resT::Verified) { exit 0 } else { exit 1 }',
+        '} catch { exit 3 }'
+    ]
+    body := ""
+    for ln in lines
+        body .= ln "`n"
+    try {
+        if FileExist(p)
+            FileDelete(p)
+        FileAppend(body, p, "UTF-8")
+        return p
+    } catch
+        return ""
+}
+
+; Hello-gated entry points used by the tray menu and global hotkeys. The
+; internal ShowSettings() re-show after a theme change stays ungated on purpose.
+RequestSettings(*) {
+    if Hello_Gate("Open MultiTool settings")
+        ShowSettings()
+}
+RequestQuit(*) {
+    if Hello_Gate("Quit MultiTool")
+        ExitApp()
+}
+
 
 CfgS(k) {
     global C
@@ -504,8 +730,8 @@ RegisterHotkeys() {
         [CfgS("Pin_HotkeyPin"),          (*) => PinWindow()],
         [CfgS("Pin_HotkeyUnpin"),        (*) => UnpinAll()],
         [CfgS("Security_HotkeyToggle"),  (*) => Sec_Toggle()],
-        [CfgS("General_HotkeyQuit"),     (*) => ExitApp()],
-        [CfgS("General_HotkeySettings"), (*) => ShowSettings()]
+        [CfgS("General_HotkeyQuit"),     (*) => RequestQuit()],
+        [CfgS("General_HotkeySettings"), (*) => RequestSettings()]
     ]
 
     Loop 5 {
@@ -769,6 +995,8 @@ RenderSection(g, t, sec, yStart) {
         refresh := ExtendTranslatorTab(g, t, &yPos)
     if (sec = "Security")
         ExtendSecurityTab(g, t, &yPos)
+    if (sec = "Access")
+        ExtendAccessTab(g, t, &yPos)
     if (sec = "Push")
         ExtendPushTab(g, t, &yPos)
     return refresh
@@ -809,30 +1037,49 @@ ExtendTranslatorTab(g, t, &yPos) {
 ; warning that this is a deterrent -- real protection lives in Windows.
 ExtendSecurityTab(g, t, &yPos) {
     g.SetFont("s10 c" t.fg, "Segoe UI")
-    g.AddButton("x28 y" yPos " w200 h28", "Enroll typing profile...")
+    g.AddButton("x28 y" yPos " w200 h28", "Enroll profile...")
         .OnEvent("Click", (*) => Sec_Enroll())
 
     g.SetFont("s9 c" t.hintFg, "Segoe UI")
     g.AddText("x240 y" (yPos + 6) " w300", Sec_StatusLine())
-    yPos += 42
+    yPos += 40
 
     g.SetFont("s10 bold c" t.popupAccent, "Segoe UI")
     g.AddText("x28 y" yPos " w540",
-        "For much better security you have to use Real protection on Windows "
-        "(BitLocker + Windows Hello + Dynamic Lock).")
-    yPos += 50
+        "Real protection on Windows = BitLocker + Windows Hello + Dynamic Lock; "
+        "this sentinel is only a deterrent.")
+    yPos += 46
 
     g.SetFont("s9 c" t.hintFg, "Segoe UI")
     g.AddText("x28 y" yPos " w540",
-        "The sentinel watches only your typing rhythm (timing aggregates -- never "
-        "the keys or text you type) and locks the screen if the rhythm stops "
-        "matching your profile. Enroll once, then tick Enable. Anyone with access "
-        "to your unlocked session can still close it, so treat it as a deterrent.")
-    yPos += 56
+        "Watches your typing, mouse and app-switching rhythm (aggregates only -- "
+        "never keys, text, coordinates or app names) and locks the screen when your "
+        "behaviour stops matching. Enroll once, then tick Enable.")
+    yPos += 50
 
     g.AddText("x28 y" yPos " w540",
-        "Needs Python on this PC with: scikit-learn, numpy, pynput  "
-        "(pip install -r requirements.txt).")
+        "Needs Python with: scikit-learn, numpy, skops, pynput (pip install -r "
+        "requirements.txt). A .venv beside MultiTool is used automatically; else "
+        "set the Python executable above to that interpreter.")
+    yPos += 50
+    g.SetFont("s10 c" t.fg, "Segoe UI")
+}
+
+; Help text for the Access sub-tab: how to identify the possession tokens, and
+; what the gates / lock-when-away actually do.
+ExtendAccessTab(g, t, &yPos) {
+    yPos += 8
+    g.SetFont("s9 c" t.hintFg, "Segoe UI")
+    g.AddText("x28 y" yPos " w540",
+        "Windows Hello gates opening Settings, turning the sentinel off, "
+        "publishing a release, and quitting. It needs a fingerprint/PIN enrolled "
+        "in Windows; if Hello isn't set up it's skipped, never blocking you.")
+    yPos += 52
+    g.AddText("x28 y" yPos " w540",
+        "Lock when away polls every ~3 s and locks the PC once your token has "
+        "been gone for the grace period.  USB key id: a VID_xxxx&PID_xxxx fragment "
+        "or device-name substring.  Bluetooth: the paired device's name or MAC.")
+    yPos += 52
     g.SetFont("s10 c" t.fg, "Segoe UI")
 }
 
@@ -958,12 +1205,14 @@ ApplyFromControls() {
     BuildBorder()
     SetStartup(C["General_RunOnStartup"] = "1")
     Sec_Apply()
+    Possess_Apply()
 
     if (errs != "") {
         MsgBox("Some hotkeys could not be set:`n`n" errs "`nThe rest were applied.",
             "MultiTool", "Icon!")
         return false
     }
+    Audit("settings", "saved")
     TrayTip("Settings applied.", "MultiTool")
     return true
 }
@@ -994,13 +1243,13 @@ SetupTray() {
     global APP_VERSION
     tray := A_TrayMenu
     tray.Delete()
-    tray.Add("Settings", (*) => ShowSettings())
+    tray.Add("Settings", (*) => RequestSettings())
     tray.Add("Check for updates", (*) => CheckForUpdates(true))
     tray.Add("Reload", (*) => Reload())
     tray.Add()
     tray.Add("MultiTool v" APP_VERSION, (*) => 0)
     tray.Disable("MultiTool v" APP_VERSION)
-    tray.Add("Exit", (*) => ExitApp())
+    tray.Add("Exit", (*) => RequestQuit())
     tray.Default := "Settings"
 }
 
@@ -1039,6 +1288,7 @@ DoTranslate(mode) {
     switch mode {
         case "copy":
             A_Clipboard := result.text
+            Clip_ScheduleClear(result.text)
             Tr_ShowPopup(result.text, "(copied -> " target ")")
         case "replace":
             PasteText(result.text)
@@ -1232,6 +1482,7 @@ FixLayout(replace) {
         return
     }
     A_Clipboard := out
+    Clip_ScheduleClear(out)
     Lf_ShowPopup(out, "  (copied)")
 }
 
@@ -1695,6 +1946,8 @@ GetOriginUrl(folder) {
 ; sure we can authenticate, then opens the release dialog. With no auth set up
 ; it offers the browser release page as a fallback.
 DoRelease() {
+    if !Hello_Gate("Publish a GitHub release")
+        return
     repoUrl := Trim(CfgS("Push_RepoUrl"))
     path    := CfgS("Push_Path")
     effective := (repoUrl != "") ? repoUrl : GetOriginUrl(path)
@@ -1813,6 +2066,7 @@ ShowReleaseDialog(repo, target) {
     Publish() {
         res := PublishRelease(repo, pending)
         if (res.ok) {
+            Audit("release", "published " repo " " pending.tag)
             d.Destroy()
             msg := "Released successfully."
             if (res.url != "")
@@ -2058,8 +2312,18 @@ SentinelProfile() {
     return A_ScriptDir "\sentinel_profile.skops"
 }
 Sec_Python() {
+    ; An explicit, non-default setting always wins.
     p := Trim(CfgS("Security_PythonPath"))
-    return (p = "") ? "python" : p
+    if (p != "" && p != "python")
+        return p
+    ; Otherwise prefer a virtual-env interpreter sitting beside the script: it's
+    ; almost certainly the one with the sentinel's deps (numpy/scikit-learn/
+    ; skops/pynput) installed, which a bare "python" on PATH often lacks.
+    for venv in [A_ScriptDir "\.venv\Scripts\python.exe",
+                 A_ScriptDir "\venv\Scripts\python.exe"]
+        if FileExist(venv)
+            return venv
+    return "python"
 }
 Sec_StatusLine() {
     if !FileExist(SentinelScript())
@@ -2096,9 +2360,10 @@ Sec_Start(interactive := true) {
     }
     if !FileExist(SentinelProfile()) {
         if interactive {
-            r := MsgBox("The keystroke sentinel must learn your typing rhythm before "
-                "it can run.`n`nEnroll a profile now? (Type normally for a few "
-                "minutes in the console that opens.)", "MultiTool", "YesNo Iconi")
+            r := MsgBox("The sentinel must learn your behaviour before it can run."
+                "`n`nEnroll a profile now? (Use the PC normally -- type, move the "
+                "mouse, switch apps -- for a few minutes in the console that opens.)",
+                "MultiTool", "YesNo Iconi")
             if (r = "Yes")
                 Sec_Enroll()
         } else {
@@ -2110,8 +2375,9 @@ Sec_Start(interactive := true) {
     try {
         Run(Format('"{1}" "{2}" monitor', Sec_Python(), script), A_ScriptDir, "Hide", &pid)
         SentinelPID := pid
+        Audit("sentinel", "started")
         if interactive
-            TrayTip("Keystroke sentinel is watching your typing rhythm.", "MultiTool")
+            TrayTip("Sentinel is watching your typing, mouse and app-switching.", "MultiTool")
     } catch as e {
         SentinelPID := 0
         if interactive
@@ -2133,13 +2399,17 @@ Sec_Stop() {
 ; so a later Apply/restart agrees, then reconcile the running process.
 Sec_Toggle() {
     global C, INI
-    newVal := (CfgS("Security_Enabled") = "1") ? "0" : "1"
+    turningOff := (CfgS("Security_Enabled") = "1")
+    if (turningOff && !Hello_Gate("Disable the keystroke sentinel"))
+        return                       ; identity check failed -- leave it running
+    newVal := turningOff ? "0" : "1"
     C["Security_Enabled"] := newVal
     IniWrite(newVal, INI, "Security", "Enabled")
     if (newVal = "1") {
         Sec_Apply(true)
     } else {
         Sec_Stop()
+        Audit("sentinel", "disabled")
         TrayTip("Keystroke sentinel stopped.", "MultiTool")
     }
 }
@@ -2162,9 +2432,117 @@ Sec_Enroll() {
 
 
 ; ==================================================================
+; ===  POSSESSION FACTOR  ==========================================
+; ==================================================================
+; "Lock when away": treat a configured USB device and/or a paired Bluetooth
+; device as proof you're at the keyboard. While Security -> "Lock when away" is
+; on, a timer polls for them; once every configured token has been gone for the
+; grace period, the workstation is locked. Detection is tolerant -- present if
+; ANY configured token is present, and a detection *error* counts as present --
+; so a glitch never locks you out, and you can carry just one token.
+PossessAbsentSince := 0.0
+
+Possess_Apply() {
+    global PossessAbsentSince
+    SetTimer(Possess_Tick, 0)
+    PossessAbsentSince := 0.0
+    mode := CfgS("Access_PossessMode")
+    if (mode = "USB" || mode = "Bluetooth" || mode = "Both") {
+        SetTimer(Possess_Tick, 3000)
+        Audit("possession", "armed (" mode ")")
+    }
+}
+
+Possess_Tick() {
+    global PossessAbsentSince
+    mode  := CfgS("Access_PossessMode")
+    usbId := Trim(CfgS("Access_PossessUsb"))
+    btId  := Trim(CfgS("Access_PossessBt"))
+    checkUsb := (mode = "USB" || mode = "Both") && usbId != ""
+    checkBt  := (mode = "Bluetooth" || mode = "Both") && btId != ""
+    if (!checkUsb && !checkBt)
+        return                       ; mode on but nothing configured -- never lock
+
+    present := false
+    if (checkUsb && Possess_UsbPresent(usbId))
+        present := true
+    if (!present && checkBt && Possess_BtConnected(btId))
+        present := true
+
+    now := A_TickCount / 1000.0
+    if (present) {
+        PossessAbsentSince := 0.0
+        return
+    }
+    if (PossessAbsentSince = 0.0) {
+        PossessAbsentSince := now     ; first miss -- start the grace clock
+        return
+    }
+    if (now - PossessAbsentSince >= CfgI("Access_PossessGrace")) {
+        Audit("possession", "token absent -- locking")
+        PossessAbsentSince := 0.0
+        DllCall("user32\LockWorkStation")
+    }
+}
+
+; USB present if any Plug-and-Play device's id or name contains the configured
+; fragment (e.g. "VID_1050&PID_0407" for a YubiKey, or a device name). A WMI
+; error counts as present so a glitch can't lock you out.
+Possess_UsbPresent(id) {
+    q := StrReplace(id, "'", "")
+    try {
+        wmi := ComObjGet("winmgmts:\\.\root\cimv2")
+        sql := "SELECT PNPDeviceID FROM Win32_PnPEntity WHERE PNPDeviceID LIKE '%"
+             . q "%' OR Name LIKE '%" q "%'"
+        for dev in wmi.ExecQuery(sql)
+            return true
+        return false
+    } catch {
+        return true
+    }
+}
+
+; Bluetooth: present if a remembered device whose name or MAC matches the
+; setting reports fConnected. Win32 Bluetooth API; any failure counts as present.
+Possess_BtConnected(idOrName) {
+    needle := StrLower(Trim(idOrName))
+    mac := StrReplace(StrReplace(StrReplace(needle, ":", ""), "-", ""), " ", "")
+    try {
+        sp := Buffer(40, 0)               ; BLUETOOTH_DEVICE_SEARCH_PARAMS (x64)
+        NumPut("uint", 40, sp, 0)         ; dwSize
+        NumPut("int", 1, sp, 4)           ; fReturnAuthenticated
+        NumPut("int", 1, sp, 8)           ; fReturnRemembered
+        NumPut("int", 1, sp, 16)          ; fReturnConnected
+        NumPut("uchar", 2, sp, 24)        ; cTimeoutMultiplier
+        di := Buffer(560, 0)              ; BLUETOOTH_DEVICE_INFO (x64)
+        NumPut("uint", 560, di, 0)        ; dwSize
+        hFind := DllCall("bthprops.cpl\BluetoothFindFirstDevice", "ptr", sp, "ptr", di, "ptr")
+        if !hFind
+            return false                  ; queried fine, no remembered devices
+        connectedMatch := false
+        loop {
+            name := StrLower(StrGet(di.Ptr + 64, 248, "UTF-16"))
+            addr := Format("{:012x}", NumGet(di, 8, "uint64"))
+            if ((InStr(name, needle) || (mac != "" && InStr(addr, mac)))
+                && NumGet(di, 20, "int"))
+                connectedMatch := true
+            NumPut("uint", 560, di, 0)
+            if !DllCall("bthprops.cpl\BluetoothFindNextDevice", "ptr", hFind, "ptr", di)
+                break
+        }
+        DllCall("bthprops.cpl\BluetoothFindDeviceClose", "ptr", hFind)
+        return connectedMatch
+    } catch {
+        return true                       ; API unavailable -> fail safe (present)
+    }
+}
+
+
+; ==================================================================
 ; ===  EXIT  =======================================================
 ; ==================================================================
 OnExitHandler(*) {
+    Audit("app", "quit")
     UnpinAll()
     DestroyBorder()
     Sec_Stop()
