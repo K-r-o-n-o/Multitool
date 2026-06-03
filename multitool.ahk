@@ -43,7 +43,7 @@ try DllCall("SetThreadDpiAwarenessContext", "ptr", -4)   ; PER_MONITOR_AWARE_V2
 INI := A_ScriptDir "\multitool.ini"
 
 ; --- bump this when you publish a new GitHub release ---
-APP_VERSION := "1.4.0"
+APP_VERSION := "1.4.1"
 GITHUB_REPO := "K-r-o-n-o/Multitool"
 
 
@@ -199,6 +199,14 @@ bPtDst := "", bSzWin := "", bPtSrc := "", bBlend := ""
 ; keystroke-sentinel module state -- must be assigned before Sec_Apply runs
 ; in STARTUP below, so we keep it up here rather than next to the helpers.
 SentinelPID := 0
+
+; WinGuard + process-protection state -- assigned here (before STARTUP) so the
+; timers and *_Apply calls below never read them before they exist.
+WinGuardOkHwnd := 0
+WinGuardBusy := false
+WinGuardHelloOk := -1
+WinGuardSuppressUntil := 0
+WatchdogPID := 0
 
 
 ; ==================================================================
@@ -2642,10 +2650,8 @@ Possess_BtConnected(idOrName) {
 ; before the prompt means the window can't be used at all while the check is
 ; pending. We only act when Hello is actually available (cached, refreshed in
 ; the background), so machines without Hello get no prompt and no interference.
-WinGuardOkHwnd      := 0     ; the reopened Settings window we already cleared
-WinGuardBusy        := false  ; a Hello check is in flight (don't re-enter)
-WinGuardHelloOk     := -1    ; cached Hello availability: -1 unknown, 0 no, 1 yes
-WinGuardSuppressUntil := 0   ; tickcount until which we ignore Settings (post-reopen)
+; State (WinGuardOkHwnd / Busy / HelloOk / SuppressUntil) is initialized in the
+; GLOBAL STATE block near the top, before STARTUP starts these timers.
 
 WinGuard_Apply() {
     global WinGuardOkHwnd, WinGuardHelloOk, WinGuardSuppressUntil
@@ -2762,21 +2768,31 @@ WinGuard_IsSettings(hwnd) {
 ;
 ; NOTE: a self-resurrecting process pair is exactly what antivirus heuristics
 ; look for -- expect AV warnings; this is opt-in and off by default.
-WatchdogPID := 0
+; (WatchdogPID is initialized in the GLOBAL STATE block near the top.)
 
 ProtectFlagPath()  => A_Temp "\multitool_quit.flag"
 WatchdogVbsPath()  => A_Temp "\multitool_watchdog.vbs"
 
 Protect_Apply() {
     if (CfgS("Access_AntiKill") = "1") {
-        Protect_SetTerminable(false)
-        Watchdog_Ensure()
-        SetTimer(Watchdog_Tick, 2000)
-    } else {
+        Protect_SetTerminable(false)          ; ACL protection takes effect immediately
+        SetTimer(Watchdog_Tick, 0)
+        SetTimer(Watchdog_Arm, -3000)         ; arm the watchdog a few seconds in, so a
+    } else {                                  ; crash during startup can't loop-resurrect
+        SetTimer(Watchdog_Arm, 0)
         SetTimer(Watchdog_Tick, 0)
         Watchdog_Stop()
         Protect_SetTerminable(true)
     }
+}
+
+; Spawn the watchdog and start the mutual-guard tick (deferred from Protect_Apply
+; so the app is past its startup before anything can resurrect it).
+Watchdog_Arm() {
+    if (CfgS("Access_AntiKill") != "1")
+        return
+    Watchdog_Ensure()
+    SetTimer(Watchdog_Tick, 2000)
 }
 
 ; Add (canTerminate=false) or remove (true) a DACL that denies the TERMINATE
