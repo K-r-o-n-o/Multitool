@@ -43,7 +43,7 @@ try DllCall("SetThreadDpiAwarenessContext", "ptr", -4)   ; PER_MONITOR_AWARE_V2
 INI := A_ScriptDir "\multitool.ini"
 
 ; --- bump this when you publish a new GitHub release ---
-APP_VERSION := "1.3.0"
+APP_VERSION := "1.4.0"
 GITHUB_REPO := "K-r-o-n-o/Multitool"
 
 
@@ -104,7 +104,12 @@ Schema := [
     {sec:"Security",   key:"Enabled",      label:"Enable keystroke sentinel", type:"bool",   def:"0"},
     {sec:"Security",   key:"HotkeyToggle", label:"Toggle sentinel",           type:"hotkey", def:""},
     {sec:"Security",   key:"PythonPath",   label:"Python executable",         type:"string", def:"python"},
-    {sec:"Access",     key:"HelloGate",    label:"Require Windows Hello", type:"bool", def:"0"},
+    {sec:"Hello",      key:"Settings",    label:"Opening MultiTool Settings", type:"bool", def:"0"},
+    {sec:"Hello",      key:"SentinelOff", label:"Turning the sentinel off",   type:"bool", def:"0"},
+    {sec:"Hello",      key:"Release",     label:"Publishing a release / using the GitHub token", type:"bool", def:"0"},
+    {sec:"Hello",      key:"Quit",        label:"Quitting MultiTool",         type:"bool", def:"0"},
+    {sec:"Hello",      key:"WinSettings", label:"Opening Windows Settings",   type:"bool", def:"1"},
+    {sec:"Access",     key:"AntiKill",     label:"Resist being killed (deny non-admin terminate + watchdog)", type:"bool", def:"0"},
     {sec:"Access",     key:"PossessMode",  label:"Lock when away", type:"choice", def:"Off",
         choices:["Off","USB","Bluetooth","Both"]},
     {sec:"Access",     key:"PossessUsb",   label:"USB key id",        type:"string", def:""},
@@ -138,7 +143,8 @@ Schema := [
 
 ; Section -> friendly caption, used for the nested sub-tabs.
 TabNames := Map("Translator","Translator", "LayoutFix","Layout Fix", "TypoFix","Typo Fix",
-                "Rainbow","Rainbow", "Pin","Pin", "Security","Sentinel", "Access","Access")
+                "Rainbow","Rainbow", "Pin","Pin", "Security","Sentinel",
+                "Hello","Hello", "Access","Lock away")
 
 ; Top-level settings tabs, in order. Each page lists the Schema section(s) it
 ; shows. A page with one section renders that section directly; a page with
@@ -151,7 +157,7 @@ TabLayout := [
     {name:"Screen",   subs:["Rainbow","Pin"]},
     {name:"For Devs", subs:["Push"]},
     {name:"Custom",   subs:["Custom"]},
-    {name:"Security", subs:["Security","Access"]},
+    {name:"Security", subs:["Security","Hello","Access"]},
     {name:"General",  subs:["General"]}
 ]
 
@@ -206,6 +212,8 @@ SetupTray()
 OnExit(OnExitHandler)
 Sec_Apply(false)   ; resume the keystroke sentinel if it was left enabled
 Possess_Apply()    ; arm the possession-factor poll if configured
+WinGuard_Apply()   ; arm the Windows-Settings Hello guard if enabled
+Protect_Apply()    ; deny-terminate + watchdog if "Resist being killed" is on
 TrayTip("Right-click the tray icon -> Settings to configure.", "MultiTool loaded")
 
 ; Background update check 5 s after startup so it doesn't slow boot.
@@ -229,6 +237,7 @@ Esc:: Lf_ClosePopup()
 LoadConfig() {
     global C, Schema, INI
     MigrateIni()
+    MigrateHelloGate()
     for item in Schema {
         k := item.sec "_" item.key
         v := IniRead(INI, item.sec, item.key, item.def)
@@ -267,6 +276,27 @@ MigrateIni() {
         IniWrite(SubStr(line, eq + 1), INI, "Push", SubStr(line, 1, eq - 1))
     }
     try IniDelete(INI, "Deploy")
+}
+
+; v1.3.0 had a single [Access] HelloGate plus [Access] HelloWinSettings. v1.3.1
+; splits the gate into per-action toggles under [Hello]. Carry old values over
+; so the user's choices aren't silently reset, then drop the old keys.
+MigrateHelloGate() {
+    global INI
+    win := ""
+    try win := IniRead(INI, "Access", "HelloWinSettings")
+    if (win != "") {
+        IniWrite(win, INI, "Hello", "WinSettings")
+        try IniDelete(INI, "Access", "HelloWinSettings")
+    }
+    gate := ""
+    try gate := IniRead(INI, "Access", "HelloGate")
+    if (gate != "") {
+        if (gate = "1")
+            for k in ["Settings", "SentinelOff", "Release", "Quit"]
+                IniWrite("1", INI, "Hello", k)
+        try IniDelete(INI, "Access", "HelloGate")
+    }
 }
 
 SaveConfig() {
@@ -409,8 +439,11 @@ Audit(event, detail := "") {
 ; UserConsentVerifier. It FAILS OPEN when Hello isn't set up on this PC or the
 ; check errors (so the app can never lock you out of your own machine), and
 ; FAILS CLOSED only on an explicit deny/cancel.
-Hello_Gate(label) {
-    if (CfgS("Access_HelloGate") != "1")
+; Gate an action behind Hello only if the user ticked it on the Hello tab.
+; `target` is the [Hello] key (Settings / SentinelOff / Release / Quit);
+; `label` is what the prompt says.
+Hello_Gate(target, label) {
+    if (CfgS("Hello_" target) != "1")
         return true
     return Hello_Verify(label)
 }
@@ -469,14 +502,56 @@ Hello_ScriptPath() {
         return ""
 }
 
+; True if Windows Hello (fingerprint / face / PIN) is set up and usable on this
+; PC. Probes UserConsentVerifier.CheckAvailabilityAsync via a tiny PowerShell
+; helper -- this shows NO prompt, so it's safe to poll. Used to decide whether
+; the Windows-Settings guard should do anything at all.
+Hello_Available() {
+    ps := Hello_AvailScriptPath()
+    if (ps = "")
+        return false
+    code := -1
+    try code := RunWait(Format('powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{1}"', ps), , "Hide")
+    return (code = 0)
+}
+
+; The availability-probe PowerShell (same WinRT plumbing as the verifier, minus
+; the RequestVerificationAsync prompt). Exit 0 = Hello available.
+Hello_AvailScriptPath() {
+    p := A_Temp "\multitool_hello_avail.ps1"
+    lines := [
+        '$ErrorActionPreference = "Stop"',
+        'try {',
+        '  [void][Windows.Security.Credentials.UI.UserConsentVerifier, Windows.Security.Credentials.UI, ContentType=WindowsRuntime]',
+        '  Add-Type -AssemblyName System.Runtime.WindowsRuntime',
+        '  $gen = "IAsyncOperation" + [char]96 + "1"',
+        '  $asTask = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq "AsTask" -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq $gen } | Select-Object -First 1',
+        '  function Await($op, $T) { $t = $asTask.MakeGenericMethod($T).Invoke($null, @($op)); $t.Wait(-1) | Out-Null; $t.Result }',
+        '  $availT = [Windows.Security.Credentials.UI.UserConsentVerifierAvailability]',
+        '  $avail = Await ([Windows.Security.Credentials.UI.UserConsentVerifier]::CheckAvailabilityAsync()) $availT',
+        '  if ($avail -eq $availT::Available) { exit 0 } else { exit 1 }',
+        '} catch { exit 1 }'
+    ]
+    body := ""
+    for ln in lines
+        body .= ln "`n"
+    try {
+        if FileExist(p)
+            FileDelete(p)
+        FileAppend(body, p, "UTF-8")
+        return p
+    } catch
+        return ""
+}
+
 ; Hello-gated entry points used by the tray menu and global hotkeys. The
 ; internal ShowSettings() re-show after a theme change stays ungated on purpose.
 RequestSettings(*) {
-    if Hello_Gate("Open MultiTool settings")
+    if Hello_Gate("Settings", "Open MultiTool settings")
         ShowSettings()
 }
 RequestQuit(*) {
-    if Hello_Gate("Quit MultiTool")
+    if Hello_Gate("Quit", "Quit MultiTool")
         ExitApp()
 }
 
@@ -995,6 +1070,8 @@ RenderSection(g, t, sec, yStart) {
         refresh := ExtendTranslatorTab(g, t, &yPos)
     if (sec = "Security")
         ExtendSecurityTab(g, t, &yPos)
+    if (sec = "Hello")
+        ExtendHelloTab(g, t, &yPos)
     if (sec = "Access")
         ExtendAccessTab(g, t, &yPos)
     if (sec = "Push")
@@ -1067,19 +1144,34 @@ ExtendSecurityTab(g, t, &yPos) {
 
 ; Help text for the Access sub-tab: how to identify the possession tokens, and
 ; what the gates / lock-when-away actually do.
-ExtendAccessTab(g, t, &yPos) {
-    yPos += 8
+; Hint for the Hello sub-tab: tick which actions demand a Windows Hello check.
+ExtendHelloTab(g, t, &yPos) {
+    yPos += 10
     g.SetFont("s9 c" t.hintFg, "Segoe UI")
     g.AddText("x28 y" yPos " w540",
-        "Windows Hello gates opening Settings, turning the sentinel off, "
-        "publishing a release, and quitting. It needs a fingerprint/PIN enrolled "
-        "in Windows; if Hello isn't set up it's skipped, never blocking you.")
-    yPos += 52
+        "Tick what should require a Windows Hello check (fingerprint / face / PIN). "
+        "Windows Settings is closed and only reopened if you pass; the others just "
+        "won't proceed without it. Needs Hello enrolled in Windows -- any box is "
+        "skipped (allowed) if Hello isn't set up, so it can't lock you out.")
+    yPos += 64
+    g.SetFont("s10 c" t.fg, "Segoe UI")
+}
+
+; Hint for the Lock-away sub-tab: anti-kill + possession.
+ExtendAccessTab(g, t, &yPos) {
+    yPos += 10
+    g.SetFont("s9 c" t.hintFg, "Segoe UI")
     g.AddText("x28 y" yPos " w540",
-        "Lock when away polls every ~3 s and locks the PC once your token has "
-        "been gone for the grace period.  USB key id: a VID_xxxx&PID_xxxx fragment "
-        "or device-name substring.  Bluetooth: the paired device's name or MAC.")
-    yPos += 52
+        "Resist being killed: denies non-elevated taskkill / Task Manager and "
+        "runs a watchdog that relaunches the app if killed. An ADMIN with an "
+        "elevated Task Manager can still kill it; the tray Exit always works. "
+        "(Self-resurrecting -- antivirus may warn.)")
+    yPos += 62
+    g.AddText("x28 y" yPos " w540",
+        "Lock when away: locks the PC once your token's been gone for the grace "
+        "period.  USB id: a VID_xxxx&PID_xxxx fragment or name.  Bluetooth: the "
+        "paired device's name or MAC.")
+    yPos += 50
     g.SetFont("s10 c" t.fg, "Segoe UI")
 }
 
@@ -1206,6 +1298,8 @@ ApplyFromControls() {
     SetStartup(C["General_RunOnStartup"] = "1")
     Sec_Apply()
     Possess_Apply()
+    WinGuard_Apply()
+    Protect_Apply()
 
     if (errs != "") {
         MsgBox("Some hotkeys could not be set:`n`n" errs "`nThe rest were applied.",
@@ -1946,7 +2040,7 @@ GetOriginUrl(folder) {
 ; sure we can authenticate, then opens the release dialog. With no auth set up
 ; it offers the browser release page as a fallback.
 DoRelease() {
-    if !Hello_Gate("Publish a GitHub release")
+    if !Hello_Gate("Release", "Publish a GitHub release")
         return
     repoUrl := Trim(CfgS("Push_RepoUrl"))
     path    := CfgS("Push_Path")
@@ -2400,7 +2494,7 @@ Sec_Stop() {
 Sec_Toggle() {
     global C, INI
     turningOff := (CfgS("Security_Enabled") = "1")
-    if (turningOff && !Hello_Gate("Disable the keystroke sentinel"))
+    if (turningOff && !Hello_Gate("SentinelOff", "Disable the keystroke sentinel"))
         return                       ; identity check failed -- leave it running
     newVal := turningOff ? "0" : "1"
     C["Security_Enabled"] := newVal
@@ -2539,9 +2633,242 @@ Possess_BtConnected(idOrName) {
 
 
 ; ==================================================================
+; ===  WINDOWS SETTINGS HELLO GUARD  ===============================
+; ==================================================================
+; When Access -> "Hello to open Windows Settings" is on, a timer watches for the
+; Windows Settings app coming to the foreground. The moment it does we FULLY
+; CLOSE it (kill the process), then demand Windows Hello. Pass -> we reopen
+; Settings ourselves and trust the new window. Fail -> it stays closed. Closing
+; before the prompt means the window can't be used at all while the check is
+; pending. We only act when Hello is actually available (cached, refreshed in
+; the background), so machines without Hello get no prompt and no interference.
+WinGuardOkHwnd      := 0     ; the reopened Settings window we already cleared
+WinGuardBusy        := false  ; a Hello check is in flight (don't re-enter)
+WinGuardHelloOk     := -1    ; cached Hello availability: -1 unknown, 0 no, 1 yes
+WinGuardSuppressUntil := 0   ; tickcount until which we ignore Settings (post-reopen)
+
+WinGuard_Apply() {
+    global WinGuardOkHwnd, WinGuardHelloOk, WinGuardSuppressUntil
+    SetTimer(WinGuard_Tick, 0)
+    SetTimer(WinGuard_RefreshHello, 0)
+    WinGuardOkHwnd := 0
+    WinGuardHelloOk := -1
+    WinGuardSuppressUntil := 0
+    if (CfgS("Hello_WinSettings") = "1") {
+        SetTimer(WinGuard_RefreshHello, -1200)   ; warm the availability cache off the startup path
+        SetTimer(WinGuard_Tick, 400)
+    }
+}
+
+; Refresh the cached "is Windows Hello usable" flag (a quick PowerShell probe
+; that shows no prompt). Runs shortly after arming and after each settings save.
+WinGuard_RefreshHello() {
+    global WinGuardHelloOk
+    WinGuardHelloOk := Hello_Available() ? 1 : 0
+}
+
+WinGuard_Tick() {
+    global WinGuardOkHwnd, WinGuardBusy, WinGuardHelloOk, WinGuardSuppressUntil
+    if (WinGuardBusy || WinGuardHelloOk != 1)
+        return                             ; busy, or Hello not usable -> do nothing
+    if (A_TickCount < WinGuardSuppressUntil)
+        return                             ; a window we just reopened after a pass
+    ; A cleared Settings window that has since closed -> re-arm.
+    if (WinGuardOkHwnd && !WinExist("ahk_id " WinGuardOkHwnd))
+        WinGuardOkHwnd := 0
+
+    hwnd := WinExist("A")                  ; the foreground window
+    if (!hwnd || !WinGuard_IsSettings(hwnd))
+        return
+    if (hwnd = WinGuardOkHwnd)
+        return                             ; already cleared this Settings window
+
+    WinGuardBusy := true
+    ; Keep Settings dead for the WHOLE prompt. This timer keeps firing even while
+    ; the blocking Hello check below runs (AHK runs timers during RunWait), so a
+    ; second Settings window opened while you ignore the prompt is killed before
+    ; it can be used. That was the bypass.
+    SetTimer(WinGuard_Killer, 90)
+    passed := false
+    try {
+        try ProcessClose("SystemSettings.exe")
+        passed := Hello_Verify("Open Windows Settings")
+    } finally {
+        SetTimer(WinGuard_Killer, 0)       ; stop killing before we maybe reopen
+    }
+
+    if (passed) {
+        ; Reopen Settings ourselves and trust the new window. The suppress
+        ; window covers the gap until we capture the new hwnd.
+        Audit("winsettings", "unlocked -- reopening")
+        WinGuardSuppressUntil := A_TickCount + 8000
+        Run("ms-settings:")
+        Loop 30 {                          ; grab the reopened window (~3 s max)
+            Sleep(100)
+            a := WinExist("A")
+            if (a && WinGuard_IsSettings(a)) {
+                WinGuardOkHwnd := a
+                break
+            }
+        }
+    } else {
+        Audit("winsettings", "DENIED -- Settings stays closed")
+        try ProcessClose("SystemSettings.exe")
+    }
+    WinGuardBusy := false
+}
+
+; Runs only while a Hello check is pending (started/stopped by WinGuard_Tick).
+; Ensures no Settings process exists, so Settings can't be opened or used during
+; the prompt no matter how many times it's launched.
+WinGuard_Killer() {
+    if ProcessExist("SystemSettings.exe")
+        ProcessClose("SystemSettings.exe")
+}
+
+; True if `hwnd` is the Windows Settings app. On Win11 its window belongs to
+; SystemSettings.exe directly; on Win10 it's hosted by ApplicationFrameHost, so
+; we look at the CoreWindow child's real process.
+WinGuard_IsSettings(hwnd) {
+    proc := ""
+    try proc := WinGetProcessName("ahk_id " hwnd)
+    if (proc = "SystemSettings.exe")
+        return true
+    if (proc = "ApplicationFrameHost.exe") {
+        child := DllCall("FindWindowExW", "ptr", hwnd, "ptr", 0,
+            "wstr", "Windows.UI.Core.CoreWindow", "ptr", 0, "ptr")
+        if child {
+            cproc := ""
+            try cproc := WinGetProcessName("ahk_id " child)
+            return (cproc = "SystemSettings.exe")
+        }
+    }
+    return false
+}
+
+
+; ==================================================================
+; ===  PROCESS PROTECTION (Access -> "Resist being killed")  =======
+; ==================================================================
+; Two honest deterrents -- a local ADMIN with an elevated Task Manager can still
+; kill anything:
+;   1. A deny-TERMINATE DACL on this process, so non-elevated taskkill /
+;      Task Manager "End task" / Stop-Process get Access Denied (tested).
+;   2. A watchdog: a hidden Windows Script Host (wscript) process that relaunches
+;      MultiTool if it's killed; MultiTool relaunches the watchdog if THAT's
+;      killed (mutual). A wscript helper (not a 2nd multitool.exe) avoids the
+;      app's #SingleInstance. A clean Exit drops a flag the watchdog honours, so
+;      quitting normally never resurrects.
+;
+; NOTE: a self-resurrecting process pair is exactly what antivirus heuristics
+; look for -- expect AV warnings; this is opt-in and off by default.
+WatchdogPID := 0
+
+ProtectFlagPath()  => A_Temp "\multitool_quit.flag"
+WatchdogVbsPath()  => A_Temp "\multitool_watchdog.vbs"
+
+Protect_Apply() {
+    if (CfgS("Access_AntiKill") = "1") {
+        Protect_SetTerminable(false)
+        Watchdog_Ensure()
+        SetTimer(Watchdog_Tick, 2000)
+    } else {
+        SetTimer(Watchdog_Tick, 0)
+        Watchdog_Stop()
+        Protect_SetTerminable(true)
+    }
+}
+
+; Add (canTerminate=false) or remove (true) a DACL that denies the TERMINATE
+; right to Everyone. Admins with SeDebugPrivilege (elevated) bypass it anyway.
+Protect_SetTerminable(canTerminate) {
+    sddl := canTerminate ? "D:(A;;0x1FFFFF;;;WD)" : "D:(D;;0x1;;;WD)(A;;0x1FFFFF;;;WD)"
+    pSD := 0
+    if !DllCall("advapi32\ConvertStringSecurityDescriptorToSecurityDescriptorW",
+                "wstr", sddl, "uint", 1, "ptr*", &pSD, "ptr", 0)
+        return
+    present := 0, pDacl := 0, defaulted := 0
+    DllCall("advapi32\GetSecurityDescriptorDacl", "ptr", pSD, "int*", &present,
+            "ptr*", &pDacl, "int*", &defaulted)
+    DllCall("advapi32\SetSecurityInfo", "ptr", DllCall("GetCurrentProcess", "ptr"),
+            "uint", 6, "uint", 4, "ptr", 0, "ptr", 0, "ptr", pDacl, "ptr", 0)
+    DllCall("LocalFree", "ptr", pSD)
+}
+
+; Spawn the hidden wscript watchdog (guarding our PID), if not already running.
+Watchdog_Ensure() {
+    global WatchdogPID
+    if (WatchdogPID && ProcessExist(WatchdogPID))
+        return
+    try FileDelete(ProtectFlagPath())          ; clear any stale clean-exit flag
+    Watchdog_WriteVbs()
+    try {
+        Run(Format('wscript.exe //B //Nologo "{1}" {2} "{3}" "{4}"',
+            WatchdogVbsPath(), ProcessExist(), A_ScriptFullPath, ProtectFlagPath()),
+            , "Hide", &pid)
+        WatchdogPID := pid
+    }
+}
+
+; Write the watchdog script: relaunch <path> if pid dies, unless the quit flag
+; appears (clean shutdown). Plain ASCII so wscript reads it as ANSI.
+Watchdog_WriteVbs() {
+    p := WatchdogVbsPath()
+    lines := [
+        "Dim pid, path, flag, fso, sh, svc",
+        "pid  = CLng(WScript.Arguments(0))",
+        "path = WScript.Arguments(1)",
+        "flag = WScript.Arguments(2)",
+        "Set fso = CreateObject(" Chr(34) "Scripting.FileSystemObject" Chr(34) ")",
+        "Set sh  = CreateObject(" Chr(34) "WScript.Shell" Chr(34) ")",
+        "Set svc = GetObject(" Chr(34) "winmgmts:\\.\root\cimv2" Chr(34) ")",
+        "Do",
+        "  WScript.Sleep 1000",
+        "  If fso.FileExists(flag) Then",
+        "    fso.DeleteFile(flag)",
+        "    WScript.Quit",
+        "  End If",
+        "  If svc.ExecQuery(" Chr(34) "SELECT ProcessId FROM Win32_Process WHERE ProcessId=" Chr(34) " & pid).Count = 0 Then",
+        "    sh.Run " Chr(34) Chr(34) Chr(34) Chr(34) " & path & " Chr(34) Chr(34) Chr(34) Chr(34) ", 0, False",
+        "    WScript.Quit",
+        "  End If",
+        "Loop"
+    ]
+    body := ""
+    for ln in lines
+        body .= ln "`r`n"
+    try FileDelete(p)
+    try FileAppend(body, p, "CP0")             ; ANSI for the script host
+}
+
+; Mutual guard: if the watchdog was killed while protection is on, respawn it.
+Watchdog_Tick() {
+    global WatchdogPID
+    if (CfgS("Access_AntiKill") != "1")
+        return
+    if (!WatchdogPID || !ProcessExist(WatchdogPID))
+        Watchdog_Ensure()
+}
+
+; Tell the watchdog to stand down (drop the flag; it quits within ~1 s).
+Watchdog_Stop() {
+    global WatchdogPID
+    try FileAppend("", ProtectFlagPath())
+    WatchdogPID := 0
+}
+
+; Signal a clean shutdown so the watchdog doesn't relaunch us. Runs on
+; ExitApp/Reload via OnExit -- but NOT on a force-kill, which is the point.
+Protect_SignalQuit() {
+    try FileAppend("", ProtectFlagPath())
+}
+
+
+; ==================================================================
 ; ===  EXIT  =======================================================
 ; ==================================================================
 OnExitHandler(*) {
+    Protect_SignalQuit()    ; first -- so a clean quit can't be resurrected
     Audit("app", "quit")
     UnpinAll()
     DestroyBorder()
