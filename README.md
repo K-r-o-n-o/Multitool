@@ -7,7 +7,7 @@ Settings persist to `multitool.ini` beside the executable.
 - **Translator** — translate the selected text (Google free, or DeepL with a key)
 - **Layout Fix** — fix text typed in the wrong keyboard layout (EN ⇄ RU same-key)
 - **Typo Fix** — correct the selection via LanguageTool
-- **Rainbow border** — rotating screen-edge overlay
+- **Rainbow border** — rotating screen-edge overlay, with an optional soft inner **glow** (configurable reach + strength)
 - **For Devs** — git add/commit/push a folder, and **publish GitHub releases**
   from the app (tag, notes, file attachments — via the GitHub CLI or a token)
 - **Pin-on-top** — make any window click-through and always-on-top
@@ -94,6 +94,29 @@ All under **Settings → Security → Access** (no Python needed — these are n
   Bluetooth device's name/MAC). MultiTool polls every few seconds and locks the
   workstation once your token has been gone for the grace period. Tolerant by
   design — present if *any* token is present, and a detection glitch never locks.
+- **Resist being killed / deleted / tampered** — opt-in (off by default). Puts a
+  deny-terminate ACL on the process so non-elevated `taskkill` / Task Manager
+  "End task" / `Stop-Process` get Access Denied, and a hidden watchdog relaunches
+  the app if it's killed. It also **deny-deletes** `multitool.exe`,
+  `multitool.ini`, and the sentinel profile (plus the folder's delete-child
+  right — both are needed, since a file-only deny is bypassed via the folder),
+  keeps hidden backups, and **self-heals**: anything deleted is restored — at
+  runtime, by the watchdog (even the exe, before relaunch), and at startup before
+  the ini is read (so a wiped ini can't boot the app unprotected). It also
+  **reverts out-of-band edits to `multitool.ini`**: settings live in memory while
+  the app runs (an on-disk edit has no live effect), and any change that doesn't
+  come from the app is rewritten from the trusted state within seconds and
+  discarded at the next startup — so nobody disables protection by editing
+  settings on disk. While it's on you can't casually delete files in the app's
+  folder, and **hand-editing the ini is reverted** (change settings in-app), so
+  **turn it off to uninstall** or to edit the ini by hand. Honest limits: this
+  stops a casual / non-admin actor, but an **admin** can take ownership and change
+  anything, a determined attacker who also edits the hidden backup wins, and a
+  self-resurrecting process pair is exactly what **antivirus** flags — expect
+  warnings. There is no way to require a Hello prompt *before* a file read/write
+  (the filesystem doesn't ask user-mode apps); that would need a kernel driver.
+  The tray **Exit** always works (and, if a Hello quit-gate is set, is itself
+  gated).
 - **Encrypted secrets** — the GitHub token and DeepL key are stored in
   `multitool.ini` as DPAPI ciphertext (`dpapi:…`), decryptable only by your
   Windows account on this PC, and masked on screen.

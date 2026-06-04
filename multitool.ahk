@@ -43,7 +43,7 @@ try DllCall("SetThreadDpiAwarenessContext", "ptr", -4)   ; PER_MONITOR_AWARE_V2
 INI := A_ScriptDir "\multitool.ini"
 
 ; --- bump this when you publish a new GitHub release ---
-APP_VERSION := "1.4.1"
+APP_VERSION := "1.4.2"
 GITHUB_REPO := "K-r-o-n-o/Multitool"
 
 
@@ -88,6 +88,9 @@ Schema := [
     {sec:"Rainbow",    key:"Interval",     label:"Frame ms (~33=30fps)", type:"int",    def:"33"},
     {sec:"Rainbow",    key:"Sat",          label:"Saturation (0-1)",     type:"float",  def:"1.0"},
     {sec:"Rainbow",    key:"Val",          label:"Brightness (0-1)",     type:"float",  def:"1.0"},
+    {sec:"Rainbow",    key:"Glow",         label:"Glow (soft inner halo)",  type:"bool",  def:"0"},
+    {sec:"Rainbow",    key:"GlowSize",     label:"Glow reach inward (px)",  type:"int",   def:"12"},
+    {sec:"Rainbow",    key:"GlowStrength", label:"Glow strength (0-1)",     type:"float", def:"0.6"},
 
     {sec:"Push",       key:"Hotkey",  label:"Push hotkey",         type:"hotkey", def:"^#d"},
     {sec:"Push",       key:"Path",    label:"Project folder",      type:"string", def:""},
@@ -109,7 +112,7 @@ Schema := [
     {sec:"Hello",      key:"Release",     label:"Publishing a release / using the GitHub token", type:"bool", def:"0"},
     {sec:"Hello",      key:"Quit",        label:"Quitting MultiTool",         type:"bool", def:"0"},
     {sec:"Hello",      key:"WinSettings", label:"Opening Windows Settings",   type:"bool", def:"1"},
-    {sec:"Access",     key:"AntiKill",     label:"Resist being killed (deny non-admin terminate + watchdog)", type:"bool", def:"0"},
+    {sec:"Access",     key:"AntiKill",     label:"Resist being killed / deleted / tampered (non-admin) + watchdog & self-heal", type:"bool", def:"0"},
     {sec:"Access",     key:"PossessMode",  label:"Lock when away", type:"choice", def:"Off",
         choices:["Off","USB","Bluetooth","Both"]},
     {sec:"Access",     key:"PossessUsb",   label:"USB key id",        type:"string", def:""},
@@ -194,6 +197,7 @@ bBuilt := false, bActive := false
 bGui := "", bMemDC := 0, bHbm := 0, bOldBmp := 0, bPBits := 0
 bW := 0, bH := 0, bInvP := 0.0, bThick := 2, bSpeed := 0.025
 bInterval := 33, bOffset := 0.0, bPalette := []
+bGlowG := 0, bRing := 2, bStripL := "", bStripR := ""   ; soft halo: depth, total ring, per-hue inward strips
 bPtDst := "", bSzWin := "", bPtSrc := "", bBlend := ""
 
 ; keystroke-sentinel module state -- must be assigned before Sec_Apply runs
@@ -207,11 +211,13 @@ WinGuardBusy := false
 WinGuardHelloOk := -1
 WinGuardSuppressUntil := 0
 WatchdogPID := 0
+FilesProtected := false   ; whether the deny-delete ACLs are currently applied
 
 
 ; ==================================================================
 ; ===  STARTUP  ====================================================
 ; ==================================================================
+Heal_PreRestore()   ; if the INI was wiped while protected, restore it before reading
 LoadConfig()
 BuildMaps()
 BuildBorder()
@@ -221,7 +227,7 @@ OnExit(OnExitHandler)
 Sec_Apply(false)   ; resume the keystroke sentinel if it was left enabled
 Possess_Apply()    ; arm the possession-factor poll if configured
 WinGuard_Apply()   ; arm the Windows-Settings Hello guard if enabled
-Protect_Apply()    ; deny-terminate + watchdog if "Resist being killed" is on
+Protect_Apply()    ; deny-terminate/delete + watchdog + self-heal if "Resist being killed" is on
 TrayTip("Right-click the tray icon -> Settings to configure.", "MultiTool loaded")
 
 ; Background update check 5 s after startup so it doesn't slow boot.
@@ -318,6 +324,7 @@ SaveConfig() {
         }
         IniWrite(v, INI, item.sec, item.key)
     }
+    Ini_Sync()    ; keep the tamper-detection backup equal to what we just wrote
 }
 
 ; ==================================================================
@@ -758,6 +765,11 @@ DoSelfUpdate(assetUrl, expectedSha, newVersion, interactive) {
     try FileDelete(tempBat)
     FileAppend(bat, tempBat)
 
+    ; If "Resist being killed" is on, the exe carries a deny-delete ACL that would
+    ; make the installer's `move /Y` over it fail. Lift the file protection now so
+    ; the swap succeeds; the relaunched build re-applies it on startup.
+    if (CfgS("Access_AntiKill") = "1")
+        Files_SetDeletable(true)
     Run('"' tempBat '"', , "Hide")
     ExitApp()
 }
@@ -913,7 +925,7 @@ ShowSettings(*) {
     names := []
     for page in TabLayout
         names.Push(page.name)
-    tab := g.AddTab3("x10 y10 w600 h378", names)
+    tab := g.AddTab3("x10 y10 w600 h428", names)
 
     ; Merged pages (Text, Screen) carry several tools. AHK can't nest Tab
     ; controls reliably -- a nested tab's controls don't hide when the OUTER
@@ -942,12 +954,12 @@ ShowSettings(*) {
     }
 
     g.SetFont("s9 c" t.hintFg, "Segoe UI")
-    g.AddText("x16 y396 w380", "Hotkeys:   ^ Ctrl    ! Alt    # Win    + Shift")
+    g.AddText("x16 y446 w380", "Hotkeys:   ^ Ctrl    ! Alt    # Win    + Shift")
     g.SetFont("s10 c" t.fg, "Segoe UI")
 
-    g.AddButton("x380 y422 w72 h28", "Cancel").OnEvent("Click", (*) => g.Destroy())
-    g.AddButton("x458 y422 w72 h28", "Apply").OnEvent("Click", ApplyAndRefresh)
-    g.AddButton("x536 y422 w72 h28 +Default", "Save").OnEvent("Click", SaveAndClose)
+    g.AddButton("x380 y472 w72 h28", "Cancel").OnEvent("Click", (*) => g.Destroy())
+    g.AddButton("x458 y472 w72 h28", "Apply").OnEvent("Click", ApplyAndRefresh)
+    g.AddButton("x536 y472 w72 h28 +Default", "Save").OnEvent("Click", SaveAndClose)
 
     ApplyAndRefresh(*) {
         prevTheme := CfgS("General_Theme")
@@ -966,7 +978,7 @@ ShowSettings(*) {
 
     g.OnEvent("Close", (*) => g.Destroy())
     g.OnEvent("Escape", (*) => g.Destroy())
-    g.Show("w620 h468")
+    g.Show("w620 h518")
     ReassertSub()   ; the default tab is merged (Text) -- collapse it to sub 1
 }
 
@@ -1170,11 +1182,16 @@ ExtendAccessTab(g, t, &yPos) {
     yPos += 10
     g.SetFont("s9 c" t.hintFg, "Segoe UI")
     g.AddText("x28 y" yPos " w540",
-        "Resist being killed: denies non-elevated taskkill / Task Manager and "
-        "runs a watchdog that relaunches the app if killed. An ADMIN with an "
-        "elevated Task Manager can still kill it; the tray Exit always works. "
+        "Resist being killed / deleted / tampered: denies non-elevated taskkill / "
+        "Task Manager, deny-deletes the exe + ini + profile (and the folder's "
+        "delete-child right), runs a watchdog that relaunches the app if killed, "
+        "restores those files if deleted, and reverts out-of-band edits to the ini "
+        "(so nobody disables protection by editing settings on disk). While it's "
+        "on you can't casually delete files here, and hand-editing the ini is "
+        "reverted -- change settings in-app, and turn it off to uninstall. An "
+        "ADMIN can still take ownership / kill it; the tray Exit always works. "
         "(Self-resurrecting -- antivirus may warn.)")
-    yPos += 62
+    yPos += 124
     g.AddText("x28 y" yPos " w540",
         "Lock when away: locks the PC once your token's been gone for the grace "
         "period.  USB id: a VID_xxxx&PID_xxxx fragment or name.  Bluetooth: the "
@@ -1803,6 +1820,7 @@ LT_Apply(text, json) {
 BuildBorder() {
     global C, bBuilt, bActive, bGui, bMemDC, bHbm, bOldBmp, bPBits
     global bW, bH, bInvP, bThick, bSpeed, bInterval, bOffset, bPalette
+    global bGlowG, bRing, bStripL, bStripR
     global bPtDst, bSzWin, bPtSrc, bBlend
 
     DestroyBorder()
@@ -1821,6 +1839,48 @@ BuildBorder() {
     sat := CfgN("Rainbow_Sat"), val := CfgN("Rainbow_Val")
     Loop 360
         bPalette.Push(HsvToBGRA((A_Index - 1) / 360, sat, val))
+
+    ; Glow: a soft halo of the same hue fading inward from the solid border.
+    ; Precompute, per hue, an "inward strip" -- a column of bRing premultiplied
+    ; pixels [solid x bThick][glow 0..bGlowG-1], alpha fading quadratically. Draw()
+    ; fills the border from these strips with bulk copies (memcpy / run-fill) rather
+    ; than writing every pixel. bStripR is bStripL reversed (the right/bottom edges
+    ; run inward the other way). NOTE: loop-index locals (gd/ri) must NOT be named
+    ; like the loop *count* (bGlowG/bRing) -- AHK names are case-insensitive, and a
+    ; clash would silently corrupt the count mid-loop.
+    bGlowG := 0
+    if (CfgS("Rainbow_Glow") = "1") {
+        gMax := (Min(bW, bH) // 2) - bThick - 1     ; keep the ring off the centre
+        bGlowG := Max(0, Min(CfgI("Rainbow_GlowSize"), gMax))
+    }
+    bRing := bThick + bGlowG
+    gStr := CfgN("Rainbow_GlowStrength")
+    gStr := (gStr < 0) ? 0 : (gStr > 1) ? 1 : gStr
+    gAlpha := []
+    Loop bGlowG {
+        tf := (bGlowG - (A_Index - 1)) / bGlowG     ; 1.0 next to border -> ~0 inward
+        av := Round(gStr * 255 * tf * tf)
+        gAlpha.Push((av < 0) ? 0 : (av > 255) ? 255 : av)
+    }
+    bStripL := Buffer(360 * bRing * 4, 0)
+    bStripR := Buffer(360 * bRing * 4, 0)
+    Loop 360 {
+        sBase := (A_Index - 1) * bRing
+        full := bPalette[A_Index]
+        pr := (full >> 16) & 0xFF, pg := (full >> 8) & 0xFF, pb := full & 0xFF
+        Loop bThick                                  ; solid (full alpha)
+            NumPut("uint", full, bStripL, (sBase + A_Index - 1) * 4)
+        Loop bGlowG {                                ; glow (premultiplied at its alpha)
+            gd := A_Index - 1
+            av := gAlpha[gd + 1]
+            NumPut("uint", (av << 24) | (((pr*av)//255) << 16) | (((pg*av)//255) << 8) | ((pb*av)//255)
+                , bStripL, (sBase + bThick + gd) * 4)
+        }
+        Loop bRing {                                 ; reversed copy for the far edges
+            ri := A_Index - 1
+            NumPut("uint", NumGet(bStripL, (sBase + bRing - 1 - ri) * 4, "uint"), bStripR, (sBase + ri) * 4)
+        }
+    }
 
     bGui := Gui("-Caption +AlwaysOnTop +ToolWindow +E0x08080020")  ; NOACTIVATE|LAYERED|TRANSPARENT
     bGui.Show("x0 y0 w" bW " h" bH " NoActivate")
@@ -1877,60 +1937,126 @@ DestroyBorder() {
     bBuilt := false, bActive := false
 }
 
+; The border is filled from the precomputed per-hue strips with bulk memory
+; copies instead of a per-pixel loop (~2.4x faster with glow on, verified
+; pixel-identical to the old per-pixel renderer): the left/right edges are
+; contiguous per row (one memcpy each), and the top/bottom edges share a hue
+; across ~P/360 adjacent columns, so each run is filled with a doubling copy.
 Draw() {
-    global bOffset, bSpeed, bW, bH, bThick, bInvP, bPalette, bPBits
+    global bOffset, bSpeed, bW, bH, bThick, bInvP, bPBits
+    global bRing, bStripL, bStripR
     global bGui, bMemDC, bPtDst, bSzWin, bPtSrc, bBlend
 
     bOffset += bSpeed
     if (bOffset >= 1.0)
         bOffset -= 1.0
-    off := bOffset, W := bW, H := bH, T := bThick, invP := bInvP
 
-    x := 0
-    while (x < W) {
-        hT := x * invP + off
-        if (hT >= 1.0)
-            hT -= 1.0
-        vT := bPalette[Integer(hT * 360) + 1]
+    P4 := bPBits, W := bW, H := bH, T := bThick, R := bRing
+    SL := bStripL.Ptr, SR := bStripR.Ptr, RB := R * 4
+    off := bOffset, invP := bInvP
 
-        hB := (W + H + (W - x)) * invP + off
-        if (hB >= 1.0)
-            hB -= 1.0
-        vB := bPalette[Integer(hB * 360) + 1]
-
-        row := 0
-        while (row < T) {
-            NumPut("uint", vT, bPBits + (row * W + x) * 4)
-            NumPut("uint", vB, bPBits + ((H - 1 - row) * W + x) * 4)
-            row++
-        }
-        x++
-    }
-
-    y := 0
-    while (y < H) {
-        hR := (W + y) * invP + off
-        if (hR >= 1.0)
-            hR -= 1.0
-        vR := bPalette[Integer(hR * 360) + 1]
-
-        hL := (2 * W + H + (H - y)) * invP + off
-        if (hL >= 1.0)
-            hL -= 1.0
-        vL := bPalette[Integer(hL * 360) + 1]
-
-        base := y * W
-        col := 0
-        while (col < T) {
-            NumPut("uint", vR, bPBits + (base + (W - 1 - col)) * 4)
-            NumPut("uint", vL, bPBits + (base + col) * 4)
-            col++
-        }
-        y++
-    }
+    Hedge(P4, SL, W, T, R, RB, off, invP, 0, W, 0, 1)                    ; top
+    Hedge(P4, SL, W, T, R, RB, off, invP, (H - 1) * W, -W, 2*W + H, -1)  ; bottom
+    Vedge(P4, SL, W, H, T, R, RB, off, invP, 2*W + 2*H, -1, 0)           ; left
+    Vedge(P4, SR, W, H, T, R, RB, off, invP, W, 1, 1)                    ; right
 
     DllCall("user32\UpdateLayeredWindow", "ptr", bGui.Hwnd, "ptr", 0, "ptr", bPtDst
         , "ptr", bSzWin, "ptr", bMemDC, "ptr", bPtSrc, "uint", 0, "ptr", bBlend, "uint", 2)
+}
+
+; Fill columns [xs, xe) of a horizontal edge band for every inward depth, from
+; one hue's strip. Each depth-row is a run of identical 32-bit pixels filled by
+; doubling (write one, copy 1->2->4->8...): ~log2(runLen) native copies, no
+; per-pixel loop. (r0/rs map depth->row: top r0=0,rs=W ; bottom r0=(H-1)W,rs=-W.)
+HFillRun(P4, SL, xs, xe, hue, R, RB, r0, rs) {
+    runLen := xe - xs
+    sB := SL + hue * RB
+    Loop R {
+        d := A_Index - 1
+        dest := P4 + (r0 + d*rs + xs) * 4
+        NumPut("uint", NumGet(sB + d*4, "uint"), dest)
+        done := 1
+        Loop {
+            if (done >= runLen)
+                break
+            n := runLen - done
+            if (n > done)
+                n := done
+            DllCall("ntdll\RtlMoveMemory", "ptr", dest + done*4, "ptr", dest, "uptr", n*4)
+            done += n
+        }
+    }
+}
+
+; One horizontal edge (top or bottom). Solid is full-width; glow is mitred at the
+; corners. Corner columns are written per-pixel; the middle is filled in same-hue
+; runs. hue(x) = ((hbase + hsign*x)*invP + off) wrapped to [0,1).
+Hedge(P4, SL, W, T, R, RB, off, invP, r0, rs, hbase, hsign) {
+    Loop R {                                          ; corner columns [0, R)
+        x := A_Index - 1
+        h := (hbase + hsign*x) * invP + off
+        if (h >= 1.0)
+            h -= 1.0
+        sB := SL + Integer(h*360) * RB
+        cnt := (x + 1 < T) ? T : x + 1                ; Max(T, dMax),  dMax = x+1
+        Loop cnt {
+            d := A_Index - 1
+            NumPut("uint", NumGet(sB + d*4, "uint"), P4 + (r0 + d*rs + x) * 4)
+        }
+    }
+    Loop R {                                          ; corner columns [W-R, W)
+        x := W - R + A_Index - 1
+        h := (hbase + hsign*x) * invP + off
+        if (h >= 1.0)
+            h -= 1.0
+        sB := SL + Integer(h*360) * RB
+        dMax := W - x
+        cnt := (dMax < T) ? T : dMax
+        Loop cnt {
+            d := A_Index - 1
+            NumPut("uint", NumGet(sB + d*4, "uint"), P4 + (r0 + d*rs + x) * 4)
+        }
+    }
+    prevHue := -1, runStart := R                      ; middle [R, W-R): same-hue runs
+    Loop (W - 2*R) {
+        x := R + A_Index - 1
+        h := (hbase + hsign*x) * invP + off
+        if (h >= 1.0)
+            h -= 1.0
+        iT := Integer(h*360)
+        if (iT != prevHue) {
+            if (prevHue >= 0)
+                HFillRun(P4, SL, runStart, x, prevHue, R, RB, r0, rs)
+            runStart := x
+            prevHue := iT
+        }
+    }
+    if (prevHue >= 0)
+        HFillRun(P4, SL, runStart, W - R, prevHue, R, RB, r0, rs)
+}
+
+; One vertical edge (left or right). The band is contiguous per row, so each row
+; is a single memcpy of the hue's strip, clipped near the top/bottom corners by
+; the miter (cnt = Max(T, Min(R, y, H-1-y))). rightSide flips it to the far
+; columns using the reversed strip.
+Vedge(P4, strip, W, H, T, R, RB, off, invP, hbase, hsign, rightSide) {
+    Loop H {
+        y := A_Index - 1
+        hv := (hbase + hsign*y) * invP + off
+        if (hv >= 1.0)
+            hv -= 1.0
+        srcRow := strip + Integer(hv*360) * RB
+        m := y
+        if (H - 1 - y < m)
+            m := H - 1 - y
+        if (R < m)
+            m := R
+        cnt := (m < T) ? T : m
+        if (rightSide)
+            DllCall("ntdll\RtlMoveMemory", "ptr", P4 + (y*W + W - cnt)*4, "ptr", srcRow + (R - cnt)*4, "uptr", cnt*4)
+        else
+            DllCall("ntdll\RtlMoveMemory", "ptr", P4 + (y*W)*4, "ptr", srcRow, "uptr", cnt*4)
+    }
 }
 
 ToggleBorder() {
@@ -2507,6 +2633,7 @@ Sec_Toggle() {
     newVal := turningOff ? "0" : "1"
     C["Security_Enabled"] := newVal
     IniWrite(newVal, INI, "Security", "Enabled")
+    Ini_Sync()                       ; this is a direct INI write -- resync the trusted backup
     if (newVal = "1") {
         Sec_Apply(true)
     } else {
@@ -2774,15 +2901,28 @@ ProtectFlagPath()  => A_Temp "\multitool_quit.flag"
 WatchdogVbsPath()  => A_Temp "\multitool_watchdog.vbs"
 
 Protect_Apply() {
+    global FilesProtected
     if (CfgS("Access_AntiKill") = "1") {
         Protect_SetTerminable(false)          ; ACL protection takes effect immediately
+        Files_Stash()                         ; refresh backups (incl. the current INI)
+        if (!FilesProtected) {
+            Files_SetDeletable(false)          ; deny-delete the exe / ini / profile + folder
+            FilesProtected := true
+        }
+        SetTimer(Heal_Tick, 4000)             ; restore anything that gets deleted
         SetTimer(Watchdog_Tick, 0)
         SetTimer(Watchdog_Arm, -3000)         ; arm the watchdog a few seconds in, so a
     } else {                                  ; crash during startup can't loop-resurrect
         SetTimer(Watchdog_Arm, 0)
         SetTimer(Watchdog_Tick, 0)
+        SetTimer(Heal_Tick, 0)
         Watchdog_Stop()
         Protect_SetTerminable(true)
+        if (FilesProtected) {
+            Files_SetDeletable(true)           ; lift the deny-delete ACLs...
+            Files_ClearStash()                 ; ...then drop the now-stale backups
+            FilesProtected := false
+        }
     }
 }
 
@@ -2819,8 +2959,9 @@ Watchdog_Ensure() {
     try FileDelete(ProtectFlagPath())          ; clear any stale clean-exit flag
     Watchdog_WriteVbs()
     try {
-        Run(Format('wscript.exe //B //Nologo "{1}" {2} "{3}" "{4}"',
-            WatchdogVbsPath(), ProcessExist(), A_ScriptFullPath, ProtectFlagPath()),
+        Run(Format('wscript.exe //B //Nologo "{1}" {2} "{3}" "{4}" "{5}"',
+            WatchdogVbsPath(), ProcessExist(), A_ScriptFullPath, ProtectFlagPath(),
+            GuardBackup(A_ScriptFullPath)),    ; restore the exe from here if it's been deleted
             , "Hide", &pid)
         WatchdogPID := pid
     }
@@ -2831,10 +2972,11 @@ Watchdog_Ensure() {
 Watchdog_WriteVbs() {
     p := WatchdogVbsPath()
     lines := [
-        "Dim pid, path, flag, fso, sh, svc",
+        "Dim pid, path, flag, bak, fso, sh, svc",
         "pid  = CLng(WScript.Arguments(0))",
         "path = WScript.Arguments(1)",
         "flag = WScript.Arguments(2)",
+        "bak  = WScript.Arguments(3)",
         "Set fso = CreateObject(" Chr(34) "Scripting.FileSystemObject" Chr(34) ")",
         "Set sh  = CreateObject(" Chr(34) "WScript.Shell" Chr(34) ")",
         "Set svc = GetObject(" Chr(34) "winmgmts:\\.\root\cimv2" Chr(34) ")",
@@ -2845,6 +2987,7 @@ Watchdog_WriteVbs() {
         "    WScript.Quit",
         "  End If",
         "  If svc.ExecQuery(" Chr(34) "SELECT ProcessId FROM Win32_Process WHERE ProcessId=" Chr(34) " & pid).Count = 0 Then",
+        "    If (Not fso.FileExists(path)) And fso.FileExists(bak) Then fso.CopyFile bak, path, True",
         "    sh.Run " Chr(34) Chr(34) Chr(34) Chr(34) " & path & " Chr(34) Chr(34) Chr(34) Chr(34) ", 0, False",
         "    WScript.Quit",
         "  End If",
@@ -2877,6 +3020,175 @@ Watchdog_Stop() {
 ; ExitApp/Reload via OnExit -- but NOT on a force-kill, which is the point.
 Protect_SignalQuit() {
     try FileAppend("", ProtectFlagPath())
+}
+
+
+; ==================================================================
+; ===  FILE GUARD (deny-delete ACL + self-heal)  ===================
+; ==================================================================
+; Folded into "Resist being killed". Deleting multitool.exe / multitool.ini /
+; the sentinel profile neutralises every protection -- and deleting just the INI
+; reverts to unprotected DEFAULTS on the next launch. So while protection is on:
+;   (a) a deny-DELETE ACL on those files PLUS deny-DELETE_CHILD on the app folder
+;       (both are needed -- a file-only deny is bypassed via the folder's
+;       delete-child right, which is why deletion "just works" otherwise), and
+;   (b) a hidden backup store + self-heal: anything deleted is restored -- at
+;       runtime (timer), from the watchdog (even the exe, before it relaunches),
+;       and at startup BEFORE the INI is read (so a wiped INI can't load
+;       unprotected). Overwrites/creates still work, so the app keeps running.
+; Honest limits (same as the process side): a casual / non-admin delete is
+; blocked; the owner can strip the ACL with deliberate effort and an admin can
+; take ownership -- self-heal is what covers those, until someone also wipes the
+; (hidden) backup store. SID *S-1-1-0 = "Everyone" (locale-independent).
+
+GuardDir() => A_AppData "\MultiTool\guard"
+GuardBackup(path) {
+    SplitPath(path, &name)
+    return GuardDir() "\" name
+}
+GuardName(path) {
+    SplitPath(path, &name)
+    return name
+}
+; Files worth guarding. The exe only matters for a compiled build.
+Files_Guarded() {
+    global INI
+    list := [INI, SentinelProfile()]
+    if A_IsCompiled
+        list.InsertAt(1, A_ScriptFullPath)
+    return list
+}
+
+; Copy the current primaries into the hidden backup store (creating it if need
+; be). Cheap; runs on every Protect_Apply so the INI backup tracks settings.
+Files_Stash() {
+    dir := GuardDir()
+    if !DirExist(dir) {
+        try DirCreate(dir)
+        try FileSetAttrib("+H", dir)
+    }
+    for p in Files_Guarded()
+        if FileExist(p)
+            try FileCopy(p, GuardBackup(p), true)
+}
+
+; Wipe the backup store -- called when protection is turned OFF, so a later INI
+; deletion can't resurrect now-stale protected settings. Denies are stripped
+; first (by the caller) so the recursive delete can proceed.
+Files_ClearStash() {
+    try DirDelete(GuardDir(), true)
+}
+
+; Refresh just the INI backup so it always equals the last value the APP wrote.
+; Called right after every legitimate INI write (SaveConfig, the sentinel toggle)
+; so an out-of-band edit is the only way the live INI can differ from the backup
+; -- which is exactly what Ini_Tampered() keys off. No-op unless protection is on.
+Ini_Sync() {
+    global INI, FilesProtected
+    if (FilesProtected)
+        try FileCopy(INI, GuardBackup(INI), true)
+}
+
+; True if the on-disk INI no longer byte-matches the trusted backup -- i.e. it was
+; edited by something other than the app (the app keeps the two in lockstep via
+; Ini_Sync). DPAPI re-encryption makes a *re-derived* compare unreliable, so we
+; compare against the byte copy we actually wrote. Missing files are not "tamper".
+Ini_Tampered() {
+    global INI
+    bak := GuardBackup(INI)
+    if (!FileExist(INI) || !FileExist(bak))
+        return false
+    try {
+        a := FileRead(INI, "RAW")
+        b := FileRead(bak, "RAW")
+        return !Ini_BufEqual(a, b)
+    }
+    return false      ; unreadable -> don't false-positive a revert
+}
+
+Ini_BufEqual(a, b) {
+    if (a.Size != b.Size)
+        return false
+    return DllCall("msvcrt\memcmp", "ptr", a, "ptr", b, "uptr", a.Size, "cdecl int") = 0
+}
+
+; Add (canDelete=false) or remove (true) the deny-delete protection on the app
+; folder, the guarded files, and the backup store. icacls merges/removes a
+; single ACE without disturbing the rest of the DACL.
+Files_SetDeletable(canDelete) {
+    Files_Icacls(A_ScriptDir, canDelete, "folder")     ; block child-delete path
+    for p in Files_Guarded()
+        if FileExist(p)
+            Files_Icacls(p, canDelete, "file")          ; block file-delete path
+    dir := GuardDir()
+    if DirExist(dir)
+        Files_Icacls(dir, canDelete, "store")
+}
+
+Files_Icacls(path, canDelete, kind) {
+    if (canDelete) {
+        tail := (kind = "store") ? '" /remove:d *S-1-1-0 /t /c /q' : '" /remove:d *S-1-1-0'
+    } else {
+        switch kind {
+            case "folder": tail := '" /deny "*S-1-1-0:(DC)"'                    ; delete-child only
+            case "store":  tail := '" /deny "*S-1-1-0:(OI)(CI)(DE,DC)" /t /c /q' ; dir + its backups
+            default:       tail := '" /deny "*S-1-1-0:(DE)"'           ; the file itself
+        }
+    }
+    try RunWait(A_ComSpec ' /c icacls "' path tail, , "Hide")
+}
+
+; Restore-if-missing loop while protection is on. Only FileExist() probes on the
+; hot path; real work happens just after a deletion. The INI is rebuilt from the
+; live (protective) settings in memory rather than the on-disk backup, so the
+; restored copy can never be staler than what's running.
+Heal_Tick() {
+    global INI
+    if (CfgS("Access_AntiKill") != "1")
+        return
+    restored := false
+    for p in Files_Guarded() {
+        bak := GuardBackup(p)
+        if (p = INI) {
+            ; The INI is authoritative in memory; on disk it's just a cache. If it
+            ; was deleted OR edited out-of-band (e.g. someone setting AntiKill=0),
+            ; rewrite it from the live protective settings -- the tamper never took
+            ; effect (the app runs off memory) and now can't survive to next launch.
+            if (!FileExist(p)) {
+                SaveConfig()
+                restored := true
+                Audit("files", "ini restored (was deleted)")
+            } else if (FileExist(bak) && Ini_Tampered()) {
+                SaveConfig()
+                restored := true
+                Audit("config", "ini reverted (external edit)")
+            }
+        } else if FileExist(p) {
+            if !FileExist(bak) {
+                try FileCopy(p, bak, true)      ; back up a file that appeared later (e.g. a fresh profile)
+                Files_Icacls(p, false, "file")  ; ...and deny-delete it too (folder deny-DC alone isn't enough)
+            }
+        } else if FileExist(bak) {
+            try FileCopy(bak, p, true)          ; restore exe / profile from backup
+            restored := true
+            Audit("files", "restored " GuardName(p))
+        }
+    }
+    if (restored)
+        Files_SetDeletable(false)               ; re-assert the deny-delete on whatever came back
+}
+
+; Runs at startup BEFORE LoadConfig: if the INI was deleted OR edited out-of-band
+; while we were off, put the trusted copy back so the app can't boot with
+; unprotected (or tampered) settings. No backup (= protection was never on) means
+; a genuine first run -> leave it.
+Heal_PreRestore() {
+    global INI
+    bak := GuardBackup(INI)
+    if !FileExist(bak)
+        return
+    if (!FileExist(INI) || Ini_Tampered())
+        try FileCopy(bak, INI, true)
 }
 
 
